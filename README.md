@@ -20,7 +20,7 @@ Overview of the datapath:
 ```
 1. DDR4
 2. AXI-DMA (100 MHz)
-3. async_fifo.sv (CDC)
+3. async_fifo (CDC)
 4. moldudp_deframer
 5. itch_parser (240 MHz)  <- tick2trade_csr feeds into this
 6. order_book             <- tick2trade_csr feeds into this
