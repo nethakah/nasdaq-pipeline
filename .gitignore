@@ -23,3 +23,6 @@ sw/itch_data.bin
 sw/gen_itch
 *.xclbin
 sw/expected.txt
+*.gz
+tb/replay/count_types
+tb/replay/replay_book

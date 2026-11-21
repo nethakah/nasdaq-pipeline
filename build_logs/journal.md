@@ -345,3 +345,32 @@ source fpga/scripts/create_bd.tcl
 - Rebuilt clean with the RTL fix for `itch_parser.sv` and ended up with WNS of +0.130ns.
 - This basically closes the project for now. 20k messages through DDR4, DMA, CDC, deframer, parser, book, signal - all matching a model with separate data structures.
 - What's left to do: real NASDAQ ITCH data, get a true throughput number in hardware, set up an Ethernet front end so it's "wire2trade" like HFT, more randomized regression testing. If I'm feeling ambitious someday maybe multi-symbol functionality, but having measured ~64Mb for 100 symbols, that'd definitely take more devices or severely cutting capacity per symbol I suppose.
+
+### log-63: Real NASDAQ data (2026-11-21)
+- Everything so far has been synthetic (`gen_itch` and the random A/E/D streams), so I pulled an actual trading day from NASDAQ's public ITCH directory: `12302019.NASDAQ_ITCH50.gz`. Picked it because it's the smallest full day on there at 3.5 GB compressed (Dec 30, 2019, quiet holiday week). It lives in `~/data/itch/` and not in the repo since it's way too big for GitHub and not mine to redistribute anyway.
+- Their `.md5sum` files 404 so I couldn't hash check it. Used `gzip -t` instead, which works since every gzip file ends with a CRC32 + length of the uncompressed data (same idea as the Ethernet FCS).
+- The day file is really just MoldUDP64 message blocks with the 20-byte packet headers stripped (2-byte big-endian length, then the message), so `tb/replay/itch_file_reader` streams it one message at a time straight out of the .gz.
+- `count_types` over the full day: 268,744,780 messages in 25s. First message is S 'O', last is S 'C', and every length matched the spec (including my A/E/D table in `msg_pkg.sv`).
+- 98% of messages change the book: A 43.6%, D 42.6%, U 8.1%, E 2.1%, X 1.0%, F 0.6%, C 0.04%. My RTL only handles A/E/D, so that's 88.3% coverage, and U is the biggest thing missing.
+- Interesting that there's ~20 deletes for every execution (114M D vs 5.8M E+C). Most orders get cancelled and never filled, which I guess is just market makers re-quoting constantly.
+- 8,906 symbols that day (counted from R messages), so if I ever index the book directly by `stock_locate` it needs 14 bits since it goes past 8,192 (2^13).
+- Big thing I didn't catch before: `msg_length()` returns 0 for anything that isn't A/E/D, and then the FSM just sits in READ_TYPE. Real data starts with an S message, so the parser would lose framing on message 1. Even just to skip a message I need its length, so all 23 types have to be in the table.
+
+### log-64: Book model against a full day (2026-11-21)
+- Extended `tb/book_model.hpp` to all 7 book-changing types:
+    1. F is just an A with an MPID tacked on, so it goes through `add_order`.
+    2. C is an E with an execution price, but the book still shrinks the order at its resting price, so it goes through `exc_order`.
+    3. X is a partial cancel (`cancel_order`).
+    4. U deletes the old order and adds a new ref (`replace_order`). U doesn't carry a side, so it has to come from the old order.
+- Added `tb/replay/replay_book.cpp`, which runs one model per `stock_locate` across the whole day and prints how big the book actually gets.
+- Made sure the upgrade didn't change anything for the old tests: `gen_itch 20000 12345` gives the same `expected.txt` the board matched in log-62.
+- Results: 0 misses across 263,241,937 book messages, and 0 live orders at the close (everything gets cancelled or filled by end of day).
+- Compared to what my RTL can hold:
+    1. Most live orders in one symbol: 37,068 (AMZN) vs 4,096 in L3.
+    2. Most price levels on one side: 4,227 (AAPL) vs 1,024 in the ladder.
+    3. 30 symbols go over L3 and 16 go over the ladder.
+    4. Biggest level was 2,000,098 shares, so 32-bit level totals are more than enough.
+    5. Whole market peaks at 1,924,078 live orders, which is ~279 Mb, and the chip only has ~38 Mb of BRAM + URAM. So every symbol on chip is not happening.
+- The interesting part is the top 10 levels only ever hold 158 to 474 orders for the busiest symbols, which is 50-235x less than the full book (AMZN: 158 vs 37,068). A full busy book is ~5.4 Mb so only about 5 would fit on chip, but keeping just the top 10 levels' orders on chip and the rest in DRAM would fit hundreds. So tiering is worth it if I want a lot of symbols.
+- Takes about 4 min for the full day.
+- Next: all 23 lengths in the parser, then X and U in the RTL, L3 to URAM, and the ladder to at least 4,227 slots a side (so 8,192).

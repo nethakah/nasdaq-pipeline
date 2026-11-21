@@ -60,6 +60,42 @@ static inline void write_u64_bigendian(uint8_t *dest, uint64_t value)
     dest[7] = (uint8_t)(value);
 }
 
+// READERS (opposite of the writers above, for pulling fields out of real data)
+
+// big-endian = high byte first
+// so each byte read shifts everything so far up by 8 (bits in a byte) and ORs in at the bottom
+static inline uint64_t read_bigendian(const uint8_t *src, int num_bytes){
+    REQUIRES(src != nullptr);
+    REQUIRES(num_bytes >= 1 && num_bytes <= 8); // 8 bytes = 64b, the widest ITCH field
+    // caller must give >= num_bytes readable bytes
+
+    uint64_t value = 0;
+    for (int i = 0; i < num_bytes; i++){
+        value = (value<<8) | src[i];
+    }
+    return value;
+}
+
+// 2 byte fields (stock locate, tracking num)
+static inline uint16_t read_u16_bigendian(const uint8_t *src){
+    return (uint16_t)read_bigendian(src, 2);
+}
+
+// 4 byte fields (shares, price)
+static inline uint32_t read_u32_bigendian(const uint8_t *src){
+    return (uint32_t)read_bigendian(src, 4);
+}
+
+// 6 byte fields (timestamp)
+static inline uint64_t read_u48_bigendian(const uint8_t *src){
+    return read_bigendian(src, 6);
+}
+
+// 8 byte fields (order ref num, match num)
+static inline uint64_t read_u64_bigendian(const uint8_t *src){
+    return read_bigendian(src, 8);
+}
+
 static inline uint64_t ticker_to_u64(const char *symbol)
 {
     REQUIRES(symbol != nullptr);
