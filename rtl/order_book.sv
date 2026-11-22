@@ -104,6 +104,22 @@ module order_book
         else rescan_level = level_t'(ask_levels[rescan_index]);
     end
 
+    // best level so far INCLUDING this cycle's slot
+    // (the last slot gets compared in the same cycle the result is written to the top of book)
+    logic rescan_take; // this slot beats the best so far
+    logic[31:0] rescan_next_price;
+    logic[31:0] rescan_next_shares;
+    always_comb begin
+        if (rescan_is_buy) begin // higher bid replaces
+            rescan_take = rescan_level.valid && (rescan_level.price > rescan_best_price);
+        end
+        else begin // lower ask replaces
+            rescan_take = rescan_level.valid && (rescan_level.price < rescan_best_price);
+        end
+        rescan_next_price = rescan_take ? rescan_level.price : rescan_best_price;
+        rescan_next_shares = rescan_take ? rescan_level.total_shares : rescan_best_shares;
+    end
+
     // THE PARALLEL COMPARES
     logic[ENTRIES_PER_BUCKET-1:0] match_hit; // indices hold whether they are the order we want
     logic[ENTRIES_PER_BUCKET-1:0] free_hit; // indices hold whether they are empty
@@ -435,27 +451,18 @@ module order_book
                 end
 
                 RESCAN: begin
-                    if (rescan_is_buy) begin // higher bid replaces
-                        if (rescan_level.valid && (rescan_level.price > rescan_best_price)) begin
-                            rescan_best_shares <= rescan_level.total_shares;
-                            rescan_best_price <= rescan_level.price;
-                        end
-                    end
-                    else begin // lower ask replaces
-                        if (rescan_level.valid && (rescan_level.price < rescan_best_price)) begin
-                            rescan_best_shares <= rescan_level.total_shares;
-                            rescan_best_price <= rescan_level.price;
-                        end
-                    end
+                    rescan_best_price <= rescan_next_price;
+                    rescan_best_shares <= rescan_next_shares;
 
                     if (rescan_index == LEVEL_ADDR_WIDTH'(NUM_LEVELS-1)) begin // cast to right size
+                        // rescan_next_*, not rescan_best_*, or the last slot never counts
                         if (rescan_is_buy) begin
-                            top_bid_shares <= rescan_best_shares;
-                            top_bid_price <= rescan_best_price;
+                            top_bid_shares <= rescan_next_shares;
+                            top_bid_price <= rescan_next_price;
                         end
                         else begin
-                            top_ask_shares <= rescan_best_shares;
-                            top_ask_price <= rescan_best_price;
+                            top_ask_shares <= rescan_next_shares;
+                            top_ask_price <= rescan_next_price;
                         end
 
                         // a U still has its add half to do (and it publishes once that lands)

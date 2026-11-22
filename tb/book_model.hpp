@@ -97,6 +97,23 @@ class BookModel{
             return (orders.count(ref_num) > 0);
         }
 
+        // side and price of a live order (false if it isn't in the book)
+        bool find_order(uint64_t ref_num, bool &is_buy, uint32_t &price){
+            auto i = orders.find(ref_num);
+            if (i == orders.end()){
+                return false;
+            }
+            is_buy = i->second.is_buy;
+            price = i->second.price;
+            return true;
+        }
+
+        // is anything resting at this price on this side
+        bool has_level(bool is_buy, uint32_t price){
+            std::map<uint32_t, Level> &levels = is_buy? bid_levels : ask_levels;
+            return (levels.count(price) > 0);
+        }
+
         // A and F
         void add_order(
             uint64_t ref_num,

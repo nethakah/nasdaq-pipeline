@@ -812,6 +812,29 @@ static void test_symbol_switch_blocks(){
     delete dut;
 }
 
+// the ladder's last slot (1023) has to be in the rescan too
+// 1007600 and 1220589 both hash to slot 1023 (16b halves XORed, low 10 bits)
+static void test_rescan_finds_last_slot(){
+    std::printf("TEST33: a rescan finds a level sitting in the ladder's last slot\n");
+    Vorder_book *dut = fresh_dut();
+
+    push_msg(dut, MSG_ADD, false, 1, 100, 829, 1002500); // best ask, slot 11
+    push_msg(dut, MSG_ADD, false, 1, 101, 342, 1007600); // next ask, slot 1023
+    push_msg(dut, MSG_DEL, false, 1, 100, 0, 0); // top empties, rescan
+    check(dut->best_ask_price, 1007600, "ask in slot 1023 promoted");
+    check(dut->best_ask_shares, 342, "its shares");
+    push_msg(dut, MSG_DEL, false, 1, 101, 0, 0); // clear the asks so the bids below can't cross them
+
+    push_msg(dut, MSG_ADD, true, 1, 200, 500, 1225000); // best bid
+    push_msg(dut, MSG_ADD, true, 1, 201, 77, 1220589); // next bid, slot 1023
+    push_msg(dut, MSG_DEL, false, 1, 200, 0, 0);
+    check(dut->best_bid_price, 1220589, "bid in slot 1023 promoted");
+    check(dut->best_bid_shares, 77, "its shares");
+
+    dut->final();
+    delete dut;
+}
+
 static void test_lifecycle(){
     std::printf("TEST11: full book lifecycle\n");
     Vorder_book *dut = fresh_dut();
@@ -1064,6 +1087,7 @@ int main(int argc, char **argv){
     test_op_halt_from_h();
     test_halts_other_symbols_ignored();
     test_symbol_switch_blocks();
+    test_rescan_finds_last_slot();
 
     std::printf("\n%s (Failures: %d)\n",
                 failures ? "FAILED" : "PASSED", failures);
