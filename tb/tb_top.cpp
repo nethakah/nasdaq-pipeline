@@ -1,10 +1,10 @@
 /*
 rm -rf obj_dir
-verilator --cc --exe --build -j 0 --assert +define+SIM --top-module tick2trade_top rtl/msg_pkg.sv rtl/skid_buffer.sv rtl/async_fifo.sv rtl/moldudp_deframer.sv rtl/itch_parser.sv rtl/order_book.sv rtl/trade_signal.sv rtl/tick2trade_csr.sv rtl/tick2trade_top.sv tb/tb_tick2trade_top.cpp
-./obj_dir/Vtick2trade_top
+verilator --cc --exe --build -j 0 --assert +define+SIM --top-module top rtl/msg_pkg.sv rtl/skid_buffer.sv rtl/async_fifo.sv rtl/moldudp_deframer.sv rtl/itch_parser.sv rtl/order_book.sv rtl/trade_signal.sv rtl/top_csr.sv rtl/top.sv tb/tb_top.cpp
+./obj_dir/Vtop
 */
 
-#include "Vtick2trade_top.h"
+#include "Vtop.h"
 #include <verilated.h>
 #include <cstdio>
 #include <cstdint>
@@ -28,6 +28,7 @@ static constexpr uint32_t REG_FIRE_LATENCY = 0x4C;
 static constexpr uint32_t REG_LATENCY_MIN = 0x50;
 static constexpr uint32_t REG_LATENCY_MAX = 0x54;
 static constexpr uint32_t REG_PACKET_LATENCY = 0x58;
+static constexpr uint32_t REG_SYMBOL_STATE = 0x5C;
 
 static constexpr uint32_t REG_BEST_BID_PRICE = 0x20;
 static constexpr uint32_t REG_BEST_ASK_PRICE = 0x28;
@@ -47,7 +48,7 @@ static void check(uint64_t actual, uint64_t expected, const char *name){
     }
 }
 
-static void tick(Vtick2trade_top *dut){
+static void tick(Vtop *dut){
     REQUIRES(dut != nullptr);
     //
 
@@ -71,7 +72,7 @@ static bool core_rising(){
     return (sim_time % CORE_PERIOD) == 0;
 }
 
-static void reset(Vtick2trade_top *dut){
+static void reset(Vtop *dut){
     REQUIRES(dut != nullptr);
     //
 
@@ -104,14 +105,14 @@ static void reset(Vtick2trade_top *dut){
     ENSURES(dut->best_ask_price == ASK_EMPTY);
 }
 
-static Vtick2trade_top *fresh_dut(){
-    Vtick2trade_top *dut = new Vtick2trade_top;
+static Vtop *fresh_dut(){
+    Vtop *dut = new Vtop;
     reset(dut);
     return dut;
 }
 
 static void axi_write(
-    Vtick2trade_top *dut,
+    Vtop *dut,
     uint32_t addr,
     uint32_t data,
     int max_time = CORE_PERIOD*100
@@ -164,7 +165,7 @@ static void axi_write(
 }
 
 static uint32_t axi_read(
-    Vtick2trade_top *dut,
+    Vtop *dut,
     uint32_t addr,
     int max_time = CORE_PERIOD*100
 ){
@@ -210,7 +211,7 @@ static uint32_t axi_read(
 }
 
 static void preload(
-    Vtick2trade_top *dut,
+    Vtop *dut,
     bool armed,
     bool side,
     uint32_t trigger_price,
@@ -230,7 +231,7 @@ static void preload(
 }
 
 static void push_byte(
-    Vtick2trade_top *dut,
+    Vtop *dut,
     uint8_t b,
     bool last,
     int max_time = DMA_PERIOD*50
@@ -257,7 +258,7 @@ static void push_byte(
 }
 
 static void push_packet(
-    Vtick2trade_top *dut,
+    Vtop *dut,
     const uint8_t *packet,
     size_t len,
     int drain_time = CORE_PERIOD*400
@@ -302,10 +303,34 @@ static void push_packet(
     // }
 }
 
+// 1 packet with an H for locate 1, like the pre-open H spin on a real day
+// (the book won't let us trade until it sees an H 'T')
+static void push_trading_state(Vtop *dut, uint64_t sequence, char trading_state){
+    REQUIRES(dut != nullptr);
+    //
+
+    TradingAction act;
+    act.stock_locate = 1;
+    act.tracking_num = 0;
+    act.timestamp = 500;
+    act.stock = "AAPL";
+    act.trading_state = trading_state;
+    act.reason = "";
+
+    uint8_t itch_act[TRADING_ACTION_LEN];
+    build_trading_action(itch_act, act);
+
+    uint8_t packet[64]; // 20B header + (2+25)B H = 47B
+    size_t n = MOLD_HEADER_LEN;
+    n += build_mold_msg(&packet[n], itch_act, TRADING_ACTION_LEN);
+    build_mold_header(&packet[0], sequence, 1);
+    push_packet(dut, packet, n);
+}
+
 // reset to baselines works
 static void test_reset(){
     std::printf("TEST1: resets to empty book\n");
-    Vtick2trade_top *dut = fresh_dut();
+    Vtop *dut = fresh_dut();
 
     check(dut->best_bid_price, BID_EMPTY, "bid at baseline");
     check(dut->best_ask_price, ASK_EMPTY, "ask at baseline");
@@ -314,6 +339,7 @@ static void test_reset(){
     check(dut->fire_count, 0, "fire_count = 0");
     check(dut->miss_count, 0, "miss_count = 0");
     check(dut->overflow_count, 0, "overflow_count = 0");
+    check(dut->symbol_trading, 0, "not allowed to trade until an H 'T'");
 
     dut->final();
     delete dut;
@@ -322,7 +348,7 @@ static void test_reset(){
 // check MoldUDP64 packet with 2 Add orders goes in and book shows both sides
 static void test_end2end_book(){
     std::printf("TEST2: on raw packet input, order book state outputs accordingly\n");
-    Vtick2trade_top *dut = fresh_dut();
+    Vtop *dut = fresh_dut();
     axi_write(dut, REG_STOCK_LOCATE, 1);
 
     OrderAdd bid;
@@ -377,10 +403,13 @@ static void test_end2end_book(){
 // check raw packets in one side and fired order on other side
 static void test_end2end_fire(){
     std::printf("TEST3: on raw packet input, order fires accordingly\n");
-    Vtick2trade_top *dut = fresh_dut();
+    Vtop *dut = fresh_dut();
 
     preload(dut, true, true, 1230500, 100, 1000, 50);
     // buy 100 shares if ask is 123.05 or better
+
+    // the morning H for our symbol (seq 999 so the 1000 packet below has no gap)
+    push_trading_state(dut, 999, 'T');
 
     OrderAdd bid;
     bid.stock_locate  = 1;
@@ -434,7 +463,7 @@ static void test_end2end_fire(){
 // push 2 packets w sequence jumps
 static void test_gap_detection(){
     std::printf("TEST4: sequence gap detected from end to end of pipeline\n");
-    Vtick2trade_top *dut = fresh_dut();
+    Vtop *dut = fresh_dut();
     axi_write(dut, REG_STOCK_LOCATE, 1);
 
     OrderDelete del;
@@ -467,9 +496,10 @@ static void test_gap_detection(){
 
 static void test_kill_switch(){
     std::printf("TEST5: kill switch blocks fires immediately end to end of pipeline\n");
-    Vtick2trade_top *dut = fresh_dut();
+    Vtop *dut = fresh_dut();
 
     preload(dut, false, true, 1230500, 100, 1000, 50); // disarmed
+    push_trading_state(dut, 999, 'T'); // so the kill switch is the ONLY reason nothing fires
 
     OrderAdd bid;
     bid.stock_locate  = 1;
@@ -531,7 +561,7 @@ static size_t add_skip_msg(uint8_t *dest, char type){
 // (A, F, E, C, X, D in the 1st packet, U in the 2nd), with an E and a U that each empty a top level
 static void test_real_mix_packet(){
     std::printf("TEST6: packets with a real-day mix of msg types end to end\n");
-    Vtick2trade_top *dut = fresh_dut();
+    Vtop *dut = fresh_dut();
     axi_write(dut, REG_STOCK_LOCATE, 1);
     srand(4242); // skip msg bodies are random; fixed seed so a failure reproduces
 
@@ -587,6 +617,22 @@ static void test_real_mix_packet(){
     exc.shares = 300;
     exc.match_num = 2;
 
+    TradingAction act; // our symbol is trading
+    act.stock_locate = 1;
+    act.tracking_num = 7;
+    act.timestamp = 500;
+    act.stock = "AAPL";
+    act.trading_state = 'T';
+    act.reason = "";
+
+    OperationalHalt bx_halt; // BX halted our symbol, which doesn't stop trading on Nasdaq
+    bx_halt.stock_locate = 1;
+    bx_halt.tracking_num = 8;
+    bx_halt.timestamp = 4500;
+    bx_halt.stock = "AAPL";
+    bx_halt.market_code = 'B';
+    bx_halt.action = 'H';
+
     OrderReplace rpl; // moves the ask (the F, 200 left after the C) to a new price and size under a new ref
     rpl.stock_locate = 1;
     rpl.tracking_num = 6;
@@ -604,6 +650,8 @@ static void test_real_mix_packet(){
     uint8_t c_msg[ORDER_EXECUTED_PRICE_LEN];
     uint8_t e_msg[ORDER_EXECUTED_LEN];
     uint8_t u_msg[ORDER_REPLACE_LEN];
+    uint8_t h_msg[TRADING_ACTION_LEN];
+    uint8_t oph_msg[OPERATIONAL_HALT_LEN];
     build_order_add(a_bid, bid);
     build_order_add(a_bid2, bid2);
     build_order_add_mpid(f_ask, ask, "GSCO");
@@ -612,6 +660,8 @@ static void test_real_mix_packet(){
     build_order_executed_price(c_msg, exc_price);
     build_order_executed(e_msg, exc);
     build_order_replace(u_msg, rpl);
+    build_trading_action(h_msg, act);
+    build_operational_halt(oph_msg, bx_halt);
 
     // 512B is plenty: 20B header + 14 msgs, the longest being 2+50
     uint8_t packet[512];
@@ -619,7 +669,7 @@ static void test_real_mix_packet(){
     n += add_skip_msg(&packet[n], 'S'); // system event
     n += add_skip_msg(&packet[n], 'R'); // stock directory
     n += build_mold_msg(&packet[n], a_bid, ORDER_ADD_LEN);
-    n += add_skip_msg(&packet[n], 'H'); // trading action
+    n += build_mold_msg(&packet[n], h_msg, TRADING_ACTION_LEN);
     n += build_mold_msg(&packet[n], f_ask, ORDER_ADD_MPID_LEN);
     n += build_mold_msg(&packet[n], a_bid2, ORDER_ADD_LEN);
     n += build_mold_msg(&packet[n], a_other, ORDER_ADD_LEN);
@@ -627,7 +677,7 @@ static void test_real_mix_packet(){
     n += build_mold_msg(&packet[n], x_msg, ORDER_CANCEL_LEN);
     n += add_skip_msg(&packet[n], 'I'); // NOII, the longest msg
     n += build_mold_msg(&packet[n], c_msg, ORDER_EXECUTED_PRICE_LEN);
-    n += add_skip_msg(&packet[n], 'h'); // operational halt (lowercase h is its own type)
+    n += build_mold_msg(&packet[n], oph_msg, OPERATIONAL_HALT_LEN); // lowercase h is its own type
     n += build_mold_msg(&packet[n], e_msg, ORDER_EXECUTED_LEN);
     n += add_skip_msg(&packet[n], 'L'); // market participant position
     build_mold_header(&packet[0], 5000, 14); // 14 msgs total, book or not
@@ -660,6 +710,209 @@ static void test_real_mix_packet(){
     check(dut->miss_count, 0, "U found its order");
     check(dut->packet_count, 2, "2 packets");
     check(dut->gap_count, 0, "no gap between the 2 packets");
+    check(dut->symbol_trading, 1, "H 'T' allowed trading, the BX halt didn't block it");
+
+    dut->final();
+    delete dut;
+}
+
+// H/h end to end: nothing fires until H 'T', H 'H' and a Nasdaq h stop fires, a BX h doesn't
+// every packet adds a new ask that would fire on its own (at or under our 1230500 trigger)
+static void test_halts_end2end(){
+    std::printf("TEST7: halts gate fires end to end (blocked until H 'T', H 'H' and Nasdaq h block, BX h doesn't)\n");
+    Vtop *dut = fresh_dut();
+
+    preload(dut, true, true, 1230500, 100, 1000, 50); // buy 100 if the ask is 123.05 or better
+
+    OrderAdd bid;
+    bid.stock_locate = 1;
+    bid.tracking_num = 1;
+    bid.timestamp = 1000;
+    bid.order_ref_num = 100;
+    bid.is_buy = true;
+    bid.shares = 500;
+    bid.stock = "AAPL";
+    bid.price = 1230000;
+
+    OrderAdd ask = bid;
+    ask.is_buy = false;
+    ask.shares = 300;
+
+    TradingAction act;
+    act.stock_locate = 1;
+    act.tracking_num = 2;
+    act.timestamp = 2000;
+    act.stock = "AAPL";
+    act.reason = "";
+
+    OperationalHalt oph;
+    oph.stock_locate = 1;
+    oph.tracking_num = 3;
+    oph.timestamp = 3000;
+    oph.stock = "AAPL";
+
+    uint8_t a_msg[ORDER_ADD_LEN];
+    uint8_t h_msg[TRADING_ACTION_LEN];
+    uint8_t oph_msg[OPERATIONAL_HALT_LEN];
+    uint8_t packet[256]; // 20B header + up to 4 msgs of at most 2+36B
+    size_t n;
+
+    // 1) seq 1: bid + ask that would fire, but no H yet
+    n = MOLD_HEADER_LEN;
+    build_order_add(a_msg, bid);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    ask.order_ref_num = 200;
+    ask.price = 1230500;
+    build_order_add(a_msg, ask);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    build_mold_header(&packet[0], 1, 2);
+    push_packet(dut, packet, n);
+    check(dut->fire_count, 0, "no H yet, so nothing fires (fail closed)");
+    check(axi_read(dut, REG_SYMBOL_STATE), 0, "no state, not trading");
+
+    // 2) seq 3: H 'T', then another ask at the trigger
+    n = MOLD_HEADER_LEN;
+    act.trading_state = 'T';
+    build_trading_action(h_msg, act);
+    n += build_mold_msg(&packet[n], h_msg, TRADING_ACTION_LEN);
+    ask.order_ref_num = 201;
+    ask.price = 1230500;
+    build_order_add(a_msg, ask);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    build_mold_header(&packet[0], 3, 2);
+    push_packet(dut, packet, n);
+    check(dut->fire_count, 1, "trading now, fires");
+
+    // 3) seq 5: H 'H' (news pending), then an even better ask
+    n = MOLD_HEADER_LEN;
+    act.trading_state = 'H';
+    act.reason = "T1";
+    build_trading_action(h_msg, act);
+    n += build_mold_msg(&packet[n], h_msg, TRADING_ACTION_LEN);
+    ask.order_ref_num = 202;
+    ask.price = 1230400;
+    build_order_add(a_msg, ask);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    build_mold_header(&packet[0], 5, 2);
+    push_packet(dut, packet, n);
+    check(dut->fire_count, 1, "halted, no fire");
+    check(axi_read(dut, REG_SYMBOL_STATE), 'H', "state 'H', not trading");
+
+    // 4) seq 7: H 'T' back, but Nasdaq operationally halts it
+    n = MOLD_HEADER_LEN;
+    act.trading_state = 'T';
+    act.reason = "";
+    build_trading_action(h_msg, act);
+    n += build_mold_msg(&packet[n], h_msg, TRADING_ACTION_LEN);
+    oph.market_code = 'Q';
+    oph.action = 'H';
+    build_operational_halt(oph_msg, oph);
+    n += build_mold_msg(&packet[n], oph_msg, OPERATIONAL_HALT_LEN);
+    ask.order_ref_num = 203;
+    ask.price = 1230300;
+    build_order_add(a_msg, ask);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    build_mold_header(&packet[0], 7, 3);
+    push_packet(dut, packet, n);
+    check(dut->fire_count, 1, "Nasdaq op halt, no fire");
+    check(axi_read(dut, REG_SYMBOL_STATE), (1 << 8) | 'T', "state 'T' + op halt bit, not trading");
+
+    // 5) seq 10: Nasdaq lifts it, BX halts it (doesn't matter to us), another ask
+    n = MOLD_HEADER_LEN;
+    oph.market_code = 'Q';
+    oph.action = 'T';
+    build_operational_halt(oph_msg, oph);
+    n += build_mold_msg(&packet[n], oph_msg, OPERATIONAL_HALT_LEN);
+    oph.market_code = 'B';
+    oph.action = 'H';
+    build_operational_halt(oph_msg, oph);
+    n += build_mold_msg(&packet[n], oph_msg, OPERATIONAL_HALT_LEN);
+    ask.order_ref_num = 204;
+    ask.price = 1230200;
+    build_order_add(a_msg, ask);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    build_mold_header(&packet[0], 10, 3);
+    push_packet(dut, packet, n);
+    check(dut->fire_count, 2, "trading again (BX halt doesn't count), fires");
+    check(axi_read(dut, REG_SYMBOL_STATE), (1 << 9) | 'T', "state 'T', trading");
+
+    check(dut->packet_count, 5, "5 packets");
+    check(dut->gap_count, 0, "no gaps");
+    check(dut->miss_count, 0, "no misses");
+
+    dut->final();
+    delete dut;
+}
+
+// a gap = lost packets that could've had anything for our symbol, so it trips the kill switch
+// nothing fires until software re-arms, even with an ask right at our trigger
+static void test_gap_trips_kill_switch(){
+    std::printf("TEST8: a sequence gap trips the kill switch end to end until software re-arms\n");
+    Vtop *dut = fresh_dut();
+
+    preload(dut, true, true, 1230500, 100, 1000, 50); // buy 100 if the ask is 123.05 or better
+
+    TradingAction act;
+    act.stock_locate = 1;
+    act.tracking_num = 1;
+    act.timestamp = 500;
+    act.stock = "AAPL";
+    act.trading_state = 'T';
+    act.reason = "";
+
+    OrderAdd bid;
+    bid.stock_locate = 1;
+    bid.tracking_num = 2;
+    bid.timestamp = 1000;
+    bid.order_ref_num = 100;
+    bid.is_buy = true;
+    bid.shares = 500;
+    bid.stock = "AAPL";
+    bid.price = 1230000;
+
+    OrderAdd ask = bid;
+    ask.is_buy = false;
+    ask.shares = 300;
+
+    uint8_t h_msg[TRADING_ACTION_LEN];
+    uint8_t a_msg[ORDER_ADD_LEN];
+    uint8_t packet[128]; // 20B header + (2+25)B H + (2+36)B A = 85B
+    size_t n;
+
+    // seq 1: H 'T' + a bid, so next expected is 3
+    n = MOLD_HEADER_LEN;
+    build_trading_action(h_msg, act);
+    n += build_mold_msg(&packet[n], h_msg, TRADING_ACTION_LEN);
+    build_order_add(a_msg, bid);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    build_mold_header(&packet[0], 1, 2);
+    push_packet(dut, packet, n);
+
+    // seq 5: 3 and 4 never showed up, and this ask would fire on its own
+    n = MOLD_HEADER_LEN;
+    ask.order_ref_num = 200;
+    ask.price = 1230500;
+    build_order_add(a_msg, ask);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    build_mold_header(&packet[0], 5, 1);
+    push_packet(dut, packet, n);
+    check(dut->gap_count, 2, "2 msgs lost");
+    check(dut->fire_count, 0, "gap disarmed us before the ask got there");
+    check(axi_read(dut, REG_CONTROL), 0x6, "disarmed, [2] says a gap did it");
+
+    // software decides the book is fine and re-arms
+    axi_write(dut, REG_CONTROL, 0x3);
+    check(axi_read(dut, REG_CONTROL), 0x3, "re-armed, gap bit cleared");
+
+    // seq 6: a better ask fires now
+    n = MOLD_HEADER_LEN;
+    ask.order_ref_num = 201;
+    ask.price = 1230400;
+    build_order_add(a_msg, ask);
+    n += build_mold_msg(&packet[n], a_msg, ORDER_ADD_LEN);
+    build_mold_header(&packet[0], 6, 1);
+    push_packet(dut, packet, n);
+    check(dut->fire_count, 1, "fires again after the re-arm");
 
     dut->final();
     delete dut;
@@ -674,6 +927,8 @@ int main(int argc, char **argv){
     test_gap_detection();
     test_kill_switch();
     test_real_mix_packet();
+    test_halts_end2end();
+    test_gap_trips_kill_switch();
 
     std::printf("\n%s (Failures: %d)\n",
                 failures ? "FAILED" : "PASSED", failures);

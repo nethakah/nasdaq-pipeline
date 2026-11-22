@@ -9,13 +9,20 @@ package msg_pkg;
         MSG_EXC = 4'd2, // order execute (E, and C which is an E + execution price)
         MSG_DEL = 4'd3, // order delete (D)
         MSG_CXL = 4'd4, // order cancel (X), partial: the order shrinks but keeps its place in line
-        MSG_RPL = 4'd5 // order replace (U): old order out, new ref in on the SAME side (loses its place in line)
+        MSG_RPL = 4'd5, // order replace (U): old order out, new ref in on the SAME side (loses its place in line)
+        MSG_ACT = 4'd6, // stock trading action (H): symbol is trading / halted / paused / quotation only
+        MSG_OPH = 4'd7 // operational halt (h): 1 market center (Nasdaq, BX or PSX) halted or resumed the symbol
     } msgtype_enum;
 
     typedef struct packed{
     // declaration order is the bit order for ALL message types (wont match wire format from NASDAQ)
     // commented is wire format @byte location, actual parser handed down format is the order of the fields
-        // at the top on purpose so every older field keeps its bit position (tb word indices don't move)
+        // newer fields go at the top on purpose so every older field keeps its bit position (tb word indices don't move)
+        logic[7:0] rsvd3; // reserved for C++ padding
+        logic[7:0] trading_state; // @19 'T' trading / 'H' halted / 'P' paused / 'Q' quotation only ('H')
+        logic[7:0] market_code; // @19 'Q' Nasdaq / 'B' BX / 'X' PSX ('h')
+        logic[7:0] op_halt_action; // @20 'H' halted / 'T' resumed ('h')
+
         logic[63:0] new_order_ref_num; // @19 new ref the order goes by after a replace ('U')
 
         logic[26:0] rsvd0;         // reserved for C++ padding
@@ -28,12 +35,12 @@ package msg_pkg;
         logic[15:0] rsvd2;         // reserved for C++ padding
         logic[47:0] timestamp;     // @5 ns since 12am
         
-        logic[63:0] order_ref_num; // @11 book key ('U': the ORIGINAL order being replaced)
+        logic[63:0] order_ref_num; // @11 book key ('U': the ORIGINAL order being replaced) ('H'/'h': the stock symbol, unused)
         logic[31:0] shares;        // @20 shares to add ('A') / executed shares ('E') / cancelled shares ('X') / new total ('U' @27)
         logic[63:0] stock;         // @24 8-char ASCII symbol ('A')
         logic[31:0] price;         // @32 raw fixed-point (4 decimals implied) ('U': new price @31)
         logic[63:0] match_num;     // @23 match number ('E') (day unique to identify this specific execution)
-    } msg_t; // 448b with padding (so every field starts on a 32-bit boundary)
+    } msg_t; // 480b with padding (so every field starts on a 32-bit boundary)
 
     function automatic logic[5:0] msg_length( // bytes
         input logic[7:0] type_byte
@@ -43,17 +50,17 @@ package msg_pkg;
             // need EVERY type here, even the ones we don't decode, or we can't skip them and lose framing
             // 6b is enough since the longest message is 50B ('I') and 6b holds up to 63
 
-            // system / admin (skipped)
+            // system / admin (skipped, except H and h which gate trading)
             "S": msg_length = 6'd12; // system event
             "R": msg_length = 6'd39; // stock directory
-            "H": msg_length = 6'd25; // stock trading action
+            "H": msg_length = 6'd25; // stock trading action (used: halts)
             "Y": msg_length = 6'd20; // reg SHO restriction
             "L": msg_length = 6'd26; // market participant position
             "V": msg_length = 6'd35; // MWCB decline level
             "W": msg_length = 6'd12; // MWCB status
             "K": msg_length = 6'd28; // IPO quoting period update
             "J": msg_length = 6'd35; // LULD auction collar
-            "h": msg_length = 6'd21; // operational halt
+            "h": msg_length = 6'd21; // operational halt (used: halts)
 
             // the 7 book-changing types
             "A": msg_length = 6'd36; // add order
@@ -87,7 +94,9 @@ package msg_pkg;
             "D": decode_type = MSG_DEL;
             "X": decode_type = MSG_CXL;
             "U": decode_type = MSG_RPL;
-            default: decode_type = MSG_NONE; // the other 16 types never touch the book
+            "H": decode_type = MSG_ACT; // doesn't touch the book, sets whether we're allowed to trade the symbol
+            "h": decode_type = MSG_OPH; // same (lowercase h is its own type, 0x68 vs 'H' 0x48)
+            default: decode_type = MSG_NONE; // the other 14 types never matter to us
         endcase
     endfunction
 

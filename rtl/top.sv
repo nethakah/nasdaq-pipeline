@@ -1,7 +1,7 @@
 /* verilator lint_off UNUSEDSIGNAL */
 /* verilator lint_off UNUSEDPARAM */
 
-module tick2trade_top
+module top
     import msg_pkg::*;
 (
     // ingress clock domain - at PS's AXI-HP interface clock
@@ -61,7 +61,8 @@ module tick2trade_top
     output logic packet_error,
     output logic[31:0] overflow_count,
     output logic[31:0] miss_count,
-    output logic[31:0] level_collision_count
+    output logic[31:0] level_collision_count,
+    output logic symbol_trading
 );
     localparam int INGRESS_WIDTH = 9; // 8 tdata + 1 tlast
     localparam int INGRESS_DEPTH = 16; // enough depth for CDC not buffering (log-17)
@@ -102,6 +103,8 @@ module tick2trade_top
     logic[31:0] book_bid_shares;
     logic[31:0] book_ask_shares;
     logic book_valid;
+    logic[7:0] trading_state;
+    logic nasdaq_op_halted;
 
     // latency measurement/tracker via timestamps since software cant time ns events
     logic[31:0] cycle_count; // 1 tick per core_clk
@@ -158,7 +161,7 @@ module tick2trade_top
     /*
     AXI4-lite ctrl/status registers for software to write/read
     */
-    tick2trade_csr u_csr(
+    top_csr u_csr(
         .clk(core_clk),
         .rst_n(core_rst_n),
 
@@ -207,7 +210,11 @@ module tick2trade_top
         .fire_latency_cycles(fire_latency_cycles),
         .fire_latency_min(fire_latency_min),
         .fire_latency_max(fire_latency_max),
-        .packet_latency_cycles(packet_latency_cycles)
+        .packet_latency_cycles(packet_latency_cycles),
+        .trading_state(trading_state),
+        .nasdaq_op_halted(nasdaq_op_halted),
+        .symbol_trading(symbol_trading),
+        .gap_detected(gap_detected)
     );
 
     /* 
@@ -314,6 +321,11 @@ module tick2trade_top
         .best_ask_shares(book_ask_shares),
         .book_valid(book_valid),
 
+        // out (whether the symbol can be traded, from H/h)
+        .trading_state(trading_state),
+        .nasdaq_op_halted(nasdaq_op_halted),
+        .symbol_trading(symbol_trading),
+
         // out (status/checks signals)
         .overflow_count(overflow_count),
         .miss_count(miss_count),
@@ -339,6 +351,7 @@ module tick2trade_top
         .best_bid_shares(book_bid_shares),
         .best_ask_shares(book_ask_shares),
         .book_valid(book_valid),
+        .symbol_trading(symbol_trading),
 
         // in (cfg order and gates from software)
         .cfg_armed(cfg_armed),

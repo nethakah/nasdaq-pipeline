@@ -22,6 +22,13 @@ module order_book
     output logic[31:0] best_ask_shares,
     output logic book_valid,
 
+    // whether we're allowed to trade this symbol (from H/h, never from the book itself)
+    // FAIL CLOSED: blocked out of reset until an H 'T' says it's trading (spec: a symbol missing from
+    // the pre-open H spin "should be treated as halted"), so a late start or a lost H can't let us trade
+    output logic[7:0] trading_state, // last H state: 'T' trading / 'H' halted / 'P' paused / 'Q' quotation only / 0 = no H yet
+    output logic nasdaq_op_halted, // h with market code 'Q': Nasdaq itself halted the symbol (where our orders go)
+    output logic symbol_trading, // OK to trade = H said 'T' and Nasdaq isn't operationally halted
+
     // status updates
     output logic[31:0] overflow_count, // no free slot in bucket to Add
     output logic[31:0] miss_count, // executed/del referenced an order not in the book
@@ -66,6 +73,11 @@ module order_book
     logic[31:0] curr_price; // price of order being changed
     logic[31:0] shares_removed; // num of shares that leave this level
     logic order_left; // did order leave book entirely
+
+    assign symbol_trading = (trading_state == "T") && !nasdaq_op_halted;
+
+    // to catch software switching symbols (the old symbol's trading state means nothing for the new one)
+    logic[15:0] prev_stock_locate;
 
     // U = delete the old ref, then add the new ref on the same side
     // HI between the 2 halves (old order is out, new one isn't in yet)
@@ -184,6 +196,10 @@ module order_book
             book_valid <= '0;
             rpl_pending <= '0;
 
+            trading_state <= '0; // no H seen yet = not allowed to trade
+            nasdaq_op_halted <= '0;
+            prev_stock_locate <= cfg_stock_locate;
+
             top_bid_shares <= '0;
             top_ask_shares <= '0;
             top_bid_price <= '0; // new bids win by being higher so start at 0
@@ -192,12 +208,35 @@ module order_book
         else begin
             book_valid <= '0; // 1cycle pulse
 
+            // software switched symbols, so block again until the new symbol's H
+            // (an H for the new symbol in this same cycle still counts)
+            prev_stock_locate <= cfg_stock_locate;
+            if (cfg_stock_locate != prev_stock_locate) begin
+                trading_state <= '0;
+                nasdaq_op_halted <= '0;
+            end
+
             case (state)
                 IDLE: begin
                     if (s_axis_tvalid && s_axis_tready && (s_axis_tdata.stock_locate==cfg_stock_locate)) begin
-                        curr_msg <= s_axis_tdata;
-                        curr_bucket <= hash_order_ref(s_axis_tdata.order_ref_num);
-                        state <= READ_BUCKET;
+                        case (s_axis_tdata.msg_type)
+                            // H/h never touch the book, they only flip whether we can trade, so they're done in this 1 cycle
+                            MSG_ACT: begin
+                                trading_state <= s_axis_tdata.trading_state;
+                            end
+                            MSG_OPH: begin
+                                // only Nasdaq's own halt stops us (a BX or PSX halt doesn't stop trading on Nasdaq)
+                                if (s_axis_tdata.market_code == "Q") begin
+                                    nasdaq_op_halted <= (s_axis_tdata.op_halt_action != "T"); // anything but 'T' counts as halted
+                                end
+                            end
+
+                            default: begin
+                                curr_msg <= s_axis_tdata;
+                                curr_bucket <= hash_order_ref(s_axis_tdata.order_ref_num);
+                                state <= READ_BUCKET;
+                            end
+                        endcase
                     end
                 end
 
@@ -251,8 +290,7 @@ module order_book
 
                 // every msg writes both things in 1 cycle here
                 UPDATE: begin
-                    // U goes back around to add the new order
-                    // (if the top level emptied, the state <= RESCAN further down wins, since the last <= in a block wins)
+                    // U goes back around to add the new order (after a RESCAN if the top level emptied)
                     state <= (curr_msg.msg_type == MSG_RPL) ? READ_BUCKET : IDLE;
                     case (curr_msg.msg_type)
 
@@ -459,6 +497,11 @@ module order_book
             @(posedge clk) disable iff (!rst_n)
             book_valid |-> !rpl_pending
         ) else $error("published a half-done U");
+        assert property(
+            @(posedge clk) disable iff (!rst_n)
+            $rose(symbol_trading) |-> $past(s_axis_tvalid && s_axis_tready && (s_axis_tdata.stock_locate == cfg_stock_locate)
+                                            && (s_axis_tdata.msg_type == MSG_ACT || s_axis_tdata.msg_type == MSG_OPH))
+        ) else $error("trading got unblocked by something other than an H/h for our symbol");
         assert property(
             @(posedge clk) disable iff (!rst_n)
             miss_count >= $past(miss_count)

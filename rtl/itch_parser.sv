@@ -14,7 +14,7 @@ module itch_parser
     output logic      s_axis_tready, // us: always 1 for now (we can always accept 1 byte)
 
     // Master - parsed msg out
-    output msg_t      m_axis_tdata, // 448b packed msg
+    output msg_t      m_axis_tdata, // 480b packed msg
     output logic      m_axis_tvalid, // us: bundle is valid
     input logic       m_axis_tready // downstream (orderbook): it can accept stuff
 );
@@ -39,6 +39,7 @@ module itch_parser
     assign fsm_tdata.rsvd0 = '0;
     assign fsm_tdata.rsvd1 = '0;
     assign fsm_tdata.rsvd2 = '0;
+    assign fsm_tdata.rsvd3 = '0;
 
     // THE FSM (read bytes and fill-in fields) //
     always_ff @(posedge clk) begin
@@ -178,6 +179,22 @@ module itch_parser
                                     6'd33: fsm_tdata.price[15:8] <= s_axis_tdata;
                                     6'd34: fsm_tdata.price[7:0] <= s_axis_tdata;
 
+                                    default: ;
+                                endcase
+                            end
+
+                            // H/h: the stock symbol @11 landed in order_ref_num above (unused, the locate already says which symbol)
+                            MSG_ACT: begin
+                                case (byte_index)
+                                    6'd19: fsm_tdata.trading_state <= s_axis_tdata; // 'T'/'H'/'P'/'Q'
+                                    default: ; // reserved @20 and the reason code @21 (4B) aren't needed
+                                endcase
+                            end
+
+                            MSG_OPH: begin
+                                case (byte_index)
+                                    6'd19: fsm_tdata.market_code <= s_axis_tdata; // 'Q'/'B'/'X'
+                                    6'd20: fsm_tdata.op_halt_action <= s_axis_tdata; // 'H'/'T'
                                     default: ;
                                 endcase
                             end

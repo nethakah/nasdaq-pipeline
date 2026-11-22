@@ -13,6 +13,7 @@ module trade_signal
     input logic[31:0] best_ask_price,
     input logic[31:0] best_ask_shares,
     input logic book_valid, // pulse
+    input logic symbol_trading, // from H/h: 0 = halted, paused, or no H seen yet (never fire)
 
     // cfg_* configuration ports (to be written in software over AXI4-lite)
     input logic cfg_armed, // 1=go, 0=killswitch
@@ -83,9 +84,10 @@ always_comb begin
 end
 
 // check all conditions met
+// symbol_trading sits right next to the kill switch: both are hard NOs no matter what the market looks like
 logic conditions_ok;
 always_comb begin
-    if (!cfg_armed || !market_valid || !price_ok || !size_ok || !spread_ok) begin
+    if (!cfg_armed || !symbol_trading || !market_valid || !price_ok || !size_ok || !spread_ok) begin
         conditions_ok = '0;
     end 
     else begin
@@ -136,6 +138,11 @@ end
         order_fire |-> $past(cfg_armed) // if order_fire, then must be armed last cycle
     )   
     else $error("order_fire occurred while disarmed");
+    assert property(
+        @(posedge clk) disable iff (!rst_n)
+        order_fire |-> $past(symbol_trading) // if order_fire, then must have been allowed to trade last cycle
+    )
+    else $error("fired into a halted symbol (or one with no H yet)");
     assert property(
         @(posedge clk) disable iff (!rst_n)
         order_fire |-> $past(market_valid) // if order_fire, then must be valid last cycle

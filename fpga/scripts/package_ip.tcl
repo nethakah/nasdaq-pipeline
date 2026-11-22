@@ -12,12 +12,12 @@ add_files -norecurse {
     rtl/itch_parser.sv
     rtl/order_book.sv
     rtl/trade_signal.sv
-    rtl/tick2trade_csr.sv
-    rtl/tick2trade_top.sv
+    rtl/top_csr.sv
+    rtl/top.sv
 }
 
 # set top file property for vivado to know which of 9 it is
-set_property top tick2trade_top [current_fileset]
+set_property top top [current_fileset]
 update_compile_order -fileset sources_1
 
 # writes ip metadata to fpga/ip; part after is string for block design to stantiate (VLNV)

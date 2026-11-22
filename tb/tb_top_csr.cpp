@@ -1,10 +1,10 @@
 /*
 rm -rf obj_dir
-verilator --cc --exe --build -j 0 --assert +define+SIM --top-module tick2trade_csr rtl/tick2trade_csr.sv tb/tb_tick2trade_csr.cpp
-./obj_dir/Vtick2trade_csr
+verilator --cc --exe --build -j 0 --assert +define+SIM --top-module top_csr rtl/top_csr.sv tb/tb_top_csr.cpp
+./obj_dir/Vtop_csr
 */
 
-#include "Vtick2trade_csr.h"
+#include "Vtop_csr.h"
 #include <verilated.h>
 #include <cstdio>
 #include <cstdint>
@@ -35,8 +35,9 @@ static constexpr uint32_t REG_FIRE_LATENCY = 0x4C;
 static constexpr uint32_t REG_LATENCY_MIN = 0x50;
 static constexpr uint32_t REG_LATENCY_MAX = 0x54;
 static constexpr uint32_t REG_PACKET_LATENCY = 0x58;
+static constexpr uint32_t REG_SYMBOL_STATE = 0x5C;
 
-static void tick(Vtick2trade_csr *dut){
+static void tick(Vtop_csr *dut){
     REQUIRES(dut != nullptr);
     //
     dut->clk = 0;
@@ -47,7 +48,7 @@ static void tick(Vtick2trade_csr *dut){
     ENSURES(dut->clk == 1);
 }
 
-static void reset(Vtick2trade_csr *dut){
+static void reset(Vtop_csr *dut){
     REQUIRES(dut != nullptr);
     //
     dut->rst_n = 0;
@@ -72,6 +73,10 @@ static void reset(Vtick2trade_csr *dut){
     dut->fire_latency_min = 0xFFFFFFFF;
     dut->fire_latency_max = 0;
     dut->packet_latency_cycles = 0;
+    dut->trading_state = 0;
+    dut->nasdaq_op_halted = 0;
+    dut->symbol_trading = 0;
+    dut->gap_detected = 0;
 
     for (int i = 0; i < RESET_CYCLES; i++){
         tick(dut);
@@ -83,8 +88,8 @@ static void reset(Vtick2trade_csr *dut){
     ENSURES(dut->rst_n == 1);
 }
 
-static Vtick2trade_csr *fresh_dut(){
-    Vtick2trade_csr *dut = new Vtick2trade_csr;
+static Vtop_csr *fresh_dut(){
+    Vtop_csr *dut = new Vtop_csr;
     reset(dut);
 
     ENSURES(dut != nullptr);
@@ -103,7 +108,7 @@ static void check(uint64_t actual, uint64_t expected, const char *name){
 }
 
 static void axi_write(
-    Vtick2trade_csr *dut,
+    Vtop_csr *dut,
     uint32_t addr,
     uint32_t data,
     int max_wait = 100
@@ -152,7 +157,7 @@ static void axi_write(
 }
 
 static uint32_t axi_read(
-    Vtick2trade_csr *dut,
+    Vtop_csr *dut,
     uint32_t addr,
     int max_wait = 100
 ){
@@ -196,7 +201,7 @@ static uint32_t axi_read(
 // cfg should reset to a safe state
 static void test_reset_safe(){
     std::printf("TEST1: config should reset disarmed\n");
-    Vtick2trade_csr *dut = fresh_dut();
+    Vtop_csr *dut = fresh_dut();
 
     check(dut->cfg_armed, 0, "cfg_armed low at reset");
     check(dut->cfg_side, 0, "cfg_side");
@@ -212,7 +217,7 @@ static void test_reset_safe(){
 // make sure write lands on corresponding cfg_* port
 static void test_write_drives_cfg(){
     std::printf("TEST2: writes should drive cfg_* outputs\n");
-    Vtick2trade_csr *dut = fresh_dut();
+    Vtop_csr *dut = fresh_dut();
 
     axi_write(dut, REG_TRIGGER_PRICE, 1230500);
     check(dut->cfg_trigger_price, 1230500, "cfg_trigger_price");
@@ -233,7 +238,7 @@ static void test_write_drives_cfg(){
 // check ctrl's 2 flags work - bit 0 is armed and bit 1 is the side
 static void test_ctrl_bits(){
     std::printf("TEST3: ctrl register flags are packed together properly\n");
-    Vtick2trade_csr *dut = fresh_dut();
+    Vtop_csr *dut = fresh_dut();
 
     axi_write(dut, REG_CONTROL, 0x1);
     check(dut->cfg_side, 0, "sell");
@@ -251,7 +256,7 @@ static void test_ctrl_bits(){
 
 static void test_readback(){
     std::printf("TEST4: cfg regs read back fine\n");
-    Vtick2trade_csr *dut = fresh_dut();
+    Vtop_csr *dut = fresh_dut();
 
     axi_write(dut, REG_TRIGGER_PRICE, 1230500);
     check(axi_read(dut, REG_TRIGGER_PRICE), 1230500, "read back trigger_price");
@@ -268,7 +273,7 @@ static void test_readback(){
 // status inputs must appear at their respective addresses
 static void test_status_read(){
     std::printf("TEST5: status regs reflect actual pipeline inputs\n");
-    Vtick2trade_csr *dut = fresh_dut();
+    Vtop_csr *dut = fresh_dut();
 
     dut->best_bid_price = 1230000;
     dut->best_bid_shares = 500;
@@ -285,6 +290,9 @@ static void test_status_read(){
     dut->fire_latency_min = 42;
     dut->fire_latency_max = 47;
     dut->packet_latency_cycles = 103;
+    dut->trading_state = 'H';
+    dut->nasdaq_op_halted = 1;
+    dut->symbol_trading = 0;
 
     dut->eval();
 
@@ -301,6 +309,13 @@ static void test_status_read(){
     check(axi_read(dut, REG_GAP_COUNT), 6, "gap_count");
     check(axi_read(dut, REG_MISS_COUNT), 2, "miss_count");
     check(axi_read(dut, REG_PACKET_LATENCY), 103, "packet_latency_cycles");
+    check(axi_read(dut, REG_SYMBOL_STATE), (1 << 8) | 'H', "state 'H' in [7:0], op halt in [8], not trading [9]");
+
+    dut->trading_state = 'T';
+    dut->nasdaq_op_halted = 0;
+    dut->symbol_trading = 1;
+    dut->eval();
+    check(axi_read(dut, REG_SYMBOL_STATE), (1 << 9) | 'T', "state 'T', trading allowed in [9]");
 
     //
     dut->final();
@@ -310,7 +325,7 @@ static void test_status_read(){
 // writing a RO addr must be a not allowed (silently) and reading an unmapped should return 0
 static void test_unmapped_addr(){
     std::printf("TEST6: unmapped and RO addresses work as planned\n");
-    Vtick2trade_csr *dut = fresh_dut();
+    Vtop_csr *dut = fresh_dut();
 
     dut->fire_count = 3;
     dut->eval();
@@ -331,7 +346,7 @@ static void test_unmapped_addr(){
 // AW and W are independent so we commit once both are latched (doesn't matter which is first)
 static void test_write_split_channels(){
     std::printf("TEST7: AW/W independence\n");
-    Vtick2trade_csr *dut = fresh_dut();
+    Vtop_csr *dut = fresh_dut();
 
     dut->s_axi_awaddr = REG_TRIGGER_PRICE;
     dut->s_axi_awvalid = 1;
@@ -369,10 +384,53 @@ static void test_write_split_channels(){
     delete(dut);
 }
 
+// a sequence gap trips the kill switch, and only software re-arming clears it
+static void test_gap_trips_kill_switch(){
+    std::printf("TEST9: a sequence gap disarms until software re-arms\n");
+    Vtop_csr *dut = fresh_dut();
+
+    axi_write(dut, REG_CONTROL, 0x3); // armed, buy
+    check(dut->cfg_armed, 1, "armed");
+
+    dut->gap_detected = 1; // 1 cycle pulse like the deframer
+    tick(dut);
+    dut->gap_detected = 0;
+    tick(dut);
+    check(dut->cfg_armed, 0, "gap disarmed it");
+    check(dut->cfg_side, 1, "side untouched");
+    check(axi_read(dut, REG_CONTROL), 0x6, "[2] says a gap did it, [1] side kept");
+
+    axi_write(dut, REG_CONTROL, 0x3);
+    check(dut->cfg_armed, 1, "software re-armed");
+    check(axi_read(dut, REG_CONTROL), 0x3, "re-arming clears the gap bit");
+
+    // gap in the EXACT cycle a re-arm commits: the gap has to win (fail closed)
+    axi_write(dut, REG_CONTROL, 0x0);
+    dut->s_axi_awaddr = REG_CONTROL;
+    dut->s_axi_awvalid = 1;
+    dut->s_axi_wdata = 0x3;
+    dut->s_axi_wstrb = 0xF;
+    dut->s_axi_wvalid = 1;
+    dut->s_axi_bready = 1;
+    dut->eval();
+    tick(dut); // AW and W both latched on this edge
+    dut->s_axi_awvalid = 0;
+    dut->s_axi_wvalid = 0;
+    dut->gap_detected = 1;
+    tick(dut); // the write commits on this edge, same edge as the gap
+    dut->gap_detected = 0;
+    check(dut->cfg_armed, 0, "a gap in the same cycle as the re-arm still wins");
+    check(axi_read(dut, REG_CONTROL), 0x6, "and the gap bit is set");
+
+    //
+    dut->final();
+    delete dut;
+}
+
 // make sure we handle receiving data first or address first
 static void test_write_data_first(){
     std::printf("TEST8: W arrive before AW\n");
-    Vtick2trade_csr *dut = fresh_dut();
+    Vtop_csr *dut = fresh_dut();
 
     dut->s_axi_wdata = 654321;
     dut->s_axi_wstrb = 0xF;
@@ -419,6 +477,7 @@ int main(int argc, char **argv){
     test_unmapped_addr();
     test_write_split_channels();
     test_write_data_first();
+    test_gap_trips_kill_switch();
 
     std::printf("\n%s (Failures: %d)\n",
                 failures ? "FAILED" : "PASSED", failures);

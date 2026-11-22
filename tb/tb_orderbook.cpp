@@ -16,7 +16,7 @@ verilator --cc --exe --build -j 0  --assert +define+SIM --top-module order_book 
 
 static int failures = 0;
 static constexpr int RESET_CYCLES = 5;
-static constexpr int TDATA_WORDS = 14; // 448b = 32b * 14 words
+static constexpr int TDATA_WORDS = 15; // 480b = 32b * 15 words
 
 // match msg_pkg
 static constexpr uint8_t MSG_NONE = 0;
@@ -25,6 +25,8 @@ static constexpr uint8_t MSG_EXC = 2;
 static constexpr uint8_t MSG_DEL = 3;
 static constexpr uint8_t MSG_CXL = 4;
 static constexpr uint8_t MSG_RPL = 5;
+static constexpr uint8_t MSG_ACT = 6;
+static constexpr uint8_t MSG_OPH = 7;
 
 static constexpr uint32_t ASK_EMPTY = 0xFFFFFFFF;
 static constexpr uint32_t BID_EMPTY = 0;
@@ -196,6 +198,28 @@ static int push_replace(
     dut->s_axis_tdata[13] = (uint32_t)(new_ref>>32);
 
     return send_and_wait(dut, orig_ref, max_wait);
+}
+
+// H: trading_state sits in word 14 bits [23:16]
+static int push_trading_action(Vorder_book *dut, uint16_t stock_locate, char trading_state){
+    REQUIRES(dut != nullptr);
+    //
+
+    setup_msg(dut, MSG_ACT, false, stock_locate, 0, 0, 0);
+    dut->s_axis_tdata[14] = (uint32_t)(uint8_t)trading_state << 16;
+
+    return send_and_wait(dut, 0, 2000);
+}
+
+// h: market_code in word 14 bits [15:8], action in [7:0]
+static int push_op_halt(Vorder_book *dut, uint16_t stock_locate, char market_code, char action){
+    REQUIRES(dut != nullptr);
+    //
+
+    setup_msg(dut, MSG_OPH, false, stock_locate, 0, 0, 0);
+    dut->s_axis_tdata[14] = ((uint32_t)(uint8_t)market_code << 8) | (uint32_t)(uint8_t)action;
+
+    return send_and_wait(dut, 0, 2000);
 }
 
 
@@ -694,6 +718,100 @@ static void test_rpl_buckets(){
     delete dut;
 }
 
+// H/h decide whether we're allowed to trade the symbol (fail closed: blocked until an H 'T')
+
+static void test_trading_state_from_h(){
+    std::printf("TEST29: blocked out of reset, only H 'T' allows trading, H never touches the book\n");
+    Vorder_book *dut = fresh_dut();
+
+    check(dut->symbol_trading, 0, "blocked out of reset (no H seen yet)");
+    check(dut->trading_state, 0, "no state yet");
+
+    push_msg(dut, MSG_ADD, true, 1, 100, 500, 1230000);
+    int pulses = push_trading_action(dut, 1, 'T');
+    check(dut->symbol_trading, 1, "H 'T' = trading");
+    check(dut->trading_state, 'T', "state readable");
+    check(pulses, 0, "H doesn't publish a book update");
+    check(dut->best_bid_shares, 500, "book untouched");
+
+    push_trading_action(dut, 1, 'H');
+    check(dut->symbol_trading, 0, "H 'H' = halted");
+    push_trading_action(dut, 1, 'T');
+    push_trading_action(dut, 1, 'P');
+    check(dut->symbol_trading, 0, "H 'P' = paused (LULD)");
+    push_trading_action(dut, 1, 'T');
+    push_trading_action(dut, 1, 'Q');
+    check(dut->symbol_trading, 0, "H 'Q' = quotation only, still no trading");
+    push_trading_action(dut, 1, 'Z');
+    check(dut->symbol_trading, 0, "a state byte the spec doesn't have = blocked");
+    push_trading_action(dut, 1, 'T');
+    check(dut->symbol_trading, 1, "back to trading");
+
+    dut->final();
+    delete dut;
+}
+
+static void test_op_halt_from_h(){
+    std::printf("TEST30: only a Nasdaq ('Q') operational halt blocks us, BX/PSX ones don't\n");
+    Vorder_book *dut = fresh_dut();
+
+    push_trading_action(dut, 1, 'T');
+    push_op_halt(dut, 1, 'B', 'H'); // BX halted it
+    push_op_halt(dut, 1, 'X', 'H'); // PSX halted it
+    check(dut->symbol_trading, 1, "other market centers' halts don't stop us on Nasdaq");
+
+    push_op_halt(dut, 1, 'Q', 'H');
+    check(dut->nasdaq_op_halted, 1, "Nasdaq op halt seen");
+    check(dut->symbol_trading, 0, "Nasdaq halted it");
+
+    // the 2 kinds of halt are separate: an H 'T' doesn't lift a Nasdaq op halt
+    push_trading_action(dut, 1, 'T');
+    check(dut->symbol_trading, 0, "H 'T' alone doesn't undo the op halt");
+    push_op_halt(dut, 1, 'B', 'T');
+    check(dut->symbol_trading, 0, "BX resuming doesn't undo Nasdaq's halt");
+
+    push_op_halt(dut, 1, 'Q', 'T');
+    check(dut->symbol_trading, 1, "Nasdaq lifted it");
+
+    dut->final();
+    delete dut;
+}
+
+static void test_halts_other_symbols_ignored(){
+    std::printf("TEST31: H/h for other stock_locates never change our trading state\n");
+    Vorder_book *dut = fresh_dut(); // tracking locate 1
+
+    push_trading_action(dut, 2, 'T');
+    check(dut->symbol_trading, 0, "locate 2's H 'T' doesn't unblock us");
+
+    push_trading_action(dut, 1, 'T');
+    push_trading_action(dut, 2, 'H');
+    push_op_halt(dut, 2, 'Q', 'H');
+    check(dut->symbol_trading, 1, "locate 2's halts don't block us");
+
+    dut->final();
+    delete dut;
+}
+
+static void test_symbol_switch_blocks(){
+    std::printf("TEST32: software switching symbols blocks trading until the new symbol's H\n");
+    Vorder_book *dut = fresh_dut();
+
+    push_trading_action(dut, 1, 'T');
+    check(dut->symbol_trading, 1, "trading locate 1");
+
+    dut->cfg_stock_locate = 2;
+    tick(dut);
+    tick(dut);
+    check(dut->symbol_trading, 0, "locate 1's 'T' says nothing about locate 2");
+
+    push_trading_action(dut, 2, 'T');
+    check(dut->symbol_trading, 1, "locate 2's own H 'T'");
+
+    dut->final();
+    delete dut;
+}
+
 static void test_lifecycle(){
     std::printf("TEST11: full book lifecycle\n");
     Vorder_book *dut = fresh_dut();
@@ -942,6 +1060,10 @@ int main(int argc, char **argv){
     test_rpl_unknown_ref();
     test_rpl_only_order_on_side();
     test_rpl_buckets();
+    test_trading_state_from_h();
+    test_op_halt_from_h();
+    test_halts_other_symbols_ignored();
+    test_symbol_switch_blocks();
 
     std::printf("\n%s (Failures: %d)\n",
                 failures ? "FAILED" : "PASSED", failures);

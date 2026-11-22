@@ -44,6 +44,7 @@ static void reset(Vtrade_signal *dut){
     dut->best_ask_price = ASK_EMPTY;
     dut->best_bid_shares = 0;
     dut->best_ask_shares = 0;
+    dut->symbol_trading = 1; // the book decides this (blocked until H 'T'), here it's on so the other gates get tested alone
 
     for (int i = 0; i < RESET_CYCLES; i++){
         tick(dut);
@@ -210,6 +211,24 @@ static void test_spread_requirement(){
 }
 
 // unarm should stop trading in the cycle even if mid-stream
+// halted symbol = hard no, same as the kill switch, no matter how good the market looks
+static void test_halt_blocks_fire(){
+    std::printf("TEST11: a halted symbol never fires\n");
+    Vtrade_signal *dut = fresh_dut();
+
+    preload(dut, true, true, 1230500, 100, 1000, 50);
+    dut->symbol_trading = 0;
+    check(market_update(dut, 1230000, 5000, 1230500, 500), false, "halted blocks fire");
+    check(dut->fire_count, 0, "fire_count unchanged");
+
+    dut->symbol_trading = 1;
+    check(market_update(dut, 1230000, 5000, 1230500, 500), true, "trading again, fires");
+    check(dut->fire_count, 1, "fire_count=1");
+
+    dut->final();
+    delete dut;
+}
+
 static void test_kill_switch(){
     std::printf("TEST7: unarm stops trade immediately\n");
     Vtrade_signal *dut = fresh_dut();
@@ -309,6 +328,7 @@ int main(int argc, char **argv){
     test_empty_market_never_fires();
     test_one_fire_per_update();
     test_spread_readable();
+    test_halt_blocks_fire();
 
     std::printf("\n%s (Failures: %d)\n",
                 failures ? "FAILED" : "PASSED", failures);

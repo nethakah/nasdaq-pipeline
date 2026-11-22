@@ -1,6 +1,6 @@
 # set - variables
 set part xczu7ev-ffvc1156-2-e
-set top tick2trade_top
+set top top
 set outdir ./fpga/results
 
 # results
@@ -16,10 +16,10 @@ read_verilog -sv rtl/moldudp_deframer.sv
 read_verilog -sv rtl/itch_parser.sv
 read_verilog -sv rtl/order_book.sv
 read_verilog -sv rtl/trade_signal.sv
-read_verilog -sv rtl/tick2trade_csr.sv
-read_verilog -sv rtl/tick2trade_top.sv
+read_verilog -sv rtl/top_csr.sv
+read_verilog -sv rtl/top.sv
 
-read_xdc fpga/constraints/tick2trade.xdc
+read_xdc fpga/constraints/top.xdc
 
 # turn RTL into FPGA primitives
 # out_of_context so we synthesize this module alone with no pin placement or block design

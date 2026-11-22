@@ -13,7 +13,7 @@ verilator --cc --exe --build -j 0  --assert +define+SIM --top-module itch_parser
 #include "itch_messages.hpp"
 
 static constexpr int RESET_CYCLES = 5; // constexpr is C++ for eval this at compile time, not run time
-static constexpr int TDATA_WORDS = 14; // 448b = 14 words * 32 bits
+static constexpr int TDATA_WORDS = 15; // 480b = 15 words * 32 bits
 
 static int failures = 0;
 
@@ -54,6 +54,12 @@ static void reset(Vitch_parser *dut){
 
 
 /*
+word 14:
+rsvd3 (8b) - 479:472
+trading_state (8b) - 471:464
+market_code (8b) - 463:456
+op_halt_action (8b) - 455:448
+
 word 13,12:
 new_order_ref (64b) - 447:384
 
@@ -87,6 +93,27 @@ match_num (64b) - 63:0
 */
 
 // extract from padding
+static inline uint8_t get_trading_state(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    REQUIRES(dut->m_axis_tvalid);
+    //
+
+    return (uint8_t)((dut->m_axis_tdata[14] >> 16) & 0xFF);
+}
+static inline uint8_t get_market_code(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    REQUIRES(dut->m_axis_tvalid);
+    //
+
+    return (uint8_t)((dut->m_axis_tdata[14] >> 8) & 0xFF);
+}
+static inline uint8_t get_op_halt_action(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    REQUIRES(dut->m_axis_tvalid);
+    //
+
+    return (uint8_t)(dut->m_axis_tdata[14] & 0xFF);
+}
 static inline uint64_t get_new_order_ref(Vitch_parser *dut){
     REQUIRES(dut != nullptr);
     REQUIRES(dut->m_axis_tvalid);
@@ -270,6 +297,8 @@ static constexpr uint8_t MSG_EXC  = 2;
 static constexpr uint8_t MSG_DEL  = 3;
 static constexpr uint8_t MSG_CXL  = 4;
 static constexpr uint8_t MSG_RPL  = 5;
+static constexpr uint8_t MSG_ACT  = 6;
+static constexpr uint8_t MSG_OPH  = 7;
 
 static void check(uint64_t actual, uint64_t expected, const char* name){
     REQUIRES(name != nullptr);
@@ -528,6 +557,71 @@ static void test_order_replace(Vitch_parser *dut){
     check(get_price(dut), rpl.price, "price @31");
 }
 
+static void test_trading_action(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Stock Trading Action (H)\n");
+    reset(dut);
+
+    TradingAction act;
+    act.stock_locate = 1;
+    act.tracking_num = 6;
+    act.timestamp = 6000;
+    act.stock = "AAPL";
+    act.trading_state = 'H';
+    act.reason = "T1"; // halt, news pending
+
+    uint8_t msg[TRADING_ACTION_LEN];
+    build_trading_action(msg, act);
+    send_msg(dut, msg, TRADING_ACTION_LEN);
+
+    int waited = wait_for_msg(dut);
+    if (waited < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+
+    check(get_msg_type(dut), MSG_ACT, "msg_type");
+    check(get_locate(dut), act.stock_locate, "stock_locate");
+    check(get_timestamp(dut), act.timestamp, "timestamp");
+    check(get_trading_state(dut), 'H', "trading_state @19");
+}
+
+static void test_operational_halt(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Operational Halt (h)\n");
+    reset(dut);
+
+    OperationalHalt oph;
+    oph.stock_locate = 1;
+    oph.tracking_num = 7;
+    oph.timestamp = 7000;
+    oph.stock = "AAPL";
+    oph.market_code = 'Q';
+    oph.action = 'H';
+
+    uint8_t msg[OPERATIONAL_HALT_LEN];
+    build_operational_halt(msg, oph);
+    send_msg(dut, msg, OPERATIONAL_HALT_LEN);
+
+    int waited = wait_for_msg(dut);
+    if (waited < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+
+    check(get_msg_type(dut), MSG_OPH, "msg_type");
+    check(get_locate(dut), oph.stock_locate, "stock_locate");
+    check(get_timestamp(dut), oph.timestamp, "timestamp");
+    check(get_market_code(dut), 'Q', "market_code @19");
+    check(get_op_halt_action(dut), 'H', "action @20");
+}
+
 static void test_skip_non_book(Vitch_parser *dut){
     REQUIRES(dut != nullptr);
     //
@@ -560,7 +654,7 @@ static void test_skip_non_book(Vitch_parser *dut){
     del.timestamp = 3000;
     del.order_ref_num = 200;
 
-    // all 16 skip types, with the A after the 5th, the E after the 10th, the D at the very end
+    // all 14 skip types, with the A after the 5th, the E after the 10th, the D at the very end
     uint8_t stream[NUM_SKIP_TYPES * ITCH_MAX_MSG_LEN + ORDER_ADD_LEN + ORDER_EXECUTED_LEN + ORDER_DELETE_LEN];
     size_t n = 0;
     for (size_t i = 0; i < NUM_SKIP_TYPES; i++){
@@ -1068,6 +1162,9 @@ struct Expected{
     uint32_t price;
     uint64_t match_num;
     uint64_t new_order_ref_num;
+    uint8_t trading_state;
+    uint8_t market_code;
+    uint8_t op_halt_action;
 };
 // every field the parser produced for this msg type has to match what we built
 static void check_expected(Vitch_parser *dut, const Expected &e){
@@ -1096,6 +1193,13 @@ static void check_expected(Vitch_parser *dut, const Expected &e){
         check(get_new_order_ref(dut), e.new_order_ref_num, "new_ref");
         check(get_shares(dut), e.shares, "shares");
         check(get_price(dut), e.price, "price");
+    }
+    else if (e.msg_type == MSG_ACT){
+        check(get_trading_state(dut), e.trading_state, "trading_state");
+    }
+    else if (e.msg_type == MSG_OPH){
+        check(get_market_code(dut), e.market_code, "market_code");
+        check(get_op_halt_action(dut), e.op_halt_action, "op_halt_action");
     }
 }
 
@@ -1176,8 +1280,9 @@ static void test_random_stream(
     for (int i = 0; i < num_msgs; i++){
         INVARIANT(stream_len <= (size_t)num_msgs * ITCH_MAX_MSG_LEN);
         
-        int which = rand() % 8; 
+        int which = rand() % 10; 
         // 0=add, 1=exc; 2=del; 3=add w/ MPID (F); 4=exc w/ price (C); 5=non-book msg (skipped); 6=cancel (X); 7=replace (U)
+        // 8=trading action (H); 9=operational halt (h)
 
         if (which==5){
             const SkipType &t = SKIP_TYPES[rand() % NUM_SKIP_TYPES];
@@ -1288,6 +1393,43 @@ static void test_random_stream(
             e.shares = s.shares;
             e.price = s.price;
         }
+        else if (which==8 || which==9){
+            // H/h carry the stock symbol @11 where the others have the ref, so that's what lands in order_ref
+            const char *stock = tickers[rand() % 5];
+            e.order_ref_num = ticker_to_u64(stock);
+
+            if (which==8){
+                TradingAction s;
+                s.stock_locate = locate;
+                s.tracking_num = rand_u16();
+                s.timestamp = timestamp;
+                s.stock = stock;
+                s.trading_state = (char)(rand() % 256); // any byte, the parser just passes it through
+                s.reason = "T1";
+
+                build_trading_action(&stream[stream_len], s);
+                stream_len += TRADING_ACTION_LEN;
+
+                e.msg_type = MSG_ACT;
+                e.trading_state = (uint8_t)s.trading_state;
+            }
+            else{
+                OperationalHalt s;
+                s.stock_locate = locate;
+                s.tracking_num = rand_u16();
+                s.timestamp = timestamp;
+                s.stock = stock;
+                s.market_code = (char)(rand() % 256);
+                s.action = (char)(rand() % 256);
+
+                build_operational_halt(&stream[stream_len], s);
+                stream_len += OPERATIONAL_HALT_LEN;
+
+                e.msg_type = MSG_OPH;
+                e.market_code = (uint8_t)s.market_code;
+                e.op_halt_action = (uint8_t)s.action;
+            }
+        }
         else{ // which==2
             OrderDelete s;
             s.stock_locate = locate;
@@ -1363,6 +1505,8 @@ int main(int argc, char** argv){
     test_executed_price(dut);
     test_order_cancel(dut);
     test_order_replace(dut);
+    test_trading_action(dut);
+    test_operational_halt(dut);
     test_skip_non_book(dut);
     test_back2back(dut);
     test_backpressure(dut);

@@ -1,7 +1,7 @@
 /* verilator lint_off UNUSEDSIGNAL */
 /* verilator lint_off UNUSEDPARAM */
 
-module tick2trade_csr #(
+module top_csr #(
     parameter int ADDR_WIDTH = 8 
     // AXI-lite is byte addressed so 8 bits covers 64 regs
 )(
@@ -59,11 +59,15 @@ module tick2trade_csr #(
     input logic[31:0] fire_latency_cycles,
     input logic[31:0] fire_latency_min,
     input logic[31:0] fire_latency_max,
-    input logic[31:0] packet_latency_cycles
+    input logic[31:0] packet_latency_cycles,
+    input logic[7:0] trading_state,
+    input logic nasdaq_op_halted,
+    input logic symbol_trading,
+    input logic gap_detected // 1 cycle pulse from the deframer, trips the kill switch
 );
 
     // register map
-    localparam logic[5:0] REG_CONTROL = 6'h00; // RW; ([0]=armed) ([1]=side(1=buy))
+    localparam logic[5:0] REG_CONTROL = 6'h00; // RW; ([0]=armed) ([1]=side(1=buy)) ([2]=R; disarmed by a sequence gap)
     localparam logic[5:0] REG_TRIGGER_PRICE = 6'h01; // RW; fire when market hits this
     localparam logic[5:0] REG_ORDER_SHARES = 6'h02; // RW; size of preloaded order
     localparam logic[5:0] REG_SPREAD_MAX = 6'h03; // RW; max spread
@@ -84,6 +88,7 @@ module tick2trade_csr #(
     localparam logic[5:0] REG_LATENCY_MIN = 6'h14; // R; cycles, best latency we got
     localparam logic[5:0] REG_LATENCY_MAX = 6'h15; // R; cycles, worst latency we got
     localparam logic[5:0] REG_PACKET_LATENCY = 6'h16; // R; cycles, packet from start to fire
+    localparam logic[5:0] REG_SYMBOL_STATE = 6'h17; // R; [7:0]=last H state ('T'/'H'/'P'/'Q', 0 = no H yet) [8]=Nasdaq op halt [9]=allowed to trade
     localparam logic[1:0] RESP_OKAY = 2'b00; // response code (tell master whether it worked)
 
     logic[5:0] write_index;
@@ -107,6 +112,9 @@ module tick2trade_csr #(
     logic write_commit;
     assign write_commit = aw_held && w_held;
 
+    // HI = the kill switch got tripped by a sequence gap (not by software), stays until software re-arms
+    logic gap_tripped;
+
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             aw_held <= '0;
@@ -122,6 +130,7 @@ module tick2trade_csr #(
             cfg_spread_max <= '0;
             cfg_size_min <= '0;
             cfg_stock_locate <= '0;
+            gap_tripped <= '0;
         end
         else begin
             if (s_axi_awvalid && s_axi_awready) begin
@@ -137,6 +146,9 @@ module tick2trade_csr #(
                     REG_CONTROL: begin
                         cfg_armed <= w_data[0];
                         cfg_side <= w_data[1];
+                        if (w_data[0]) begin
+                            gap_tripped <= '0; // re-arming = software saying the book is good to trade on again
+                        end
                     end
                     REG_TRIGGER_PRICE: begin
                         cfg_trigger_price <= w_data;
@@ -163,6 +175,15 @@ module tick2trade_csr #(
             if (s_axi_bvalid && s_axi_bready) begin // response accepted
                 s_axi_bvalid <= '0;
             end
+
+            // a sequence gap trips the kill switch
+            // the lost msgs could've been anything for our symbol (an H 'H', a cancel of the top order, ...),
+            // so the book can't be trusted until software looks at it and re-arms
+            // a gap in the same cycle as a re-arm still wins
+            if (gap_detected) begin
+                cfg_armed <= '0;
+                gap_tripped <= 1'b1;
+            end
         end
     end
     assign s_axi_bresp = RESP_OKAY;
@@ -185,7 +206,7 @@ module tick2trade_csr #(
                 ar_index <= read_index;
                 case (read_index)
                     REG_CONTROL: begin
-                        s_axi_rdata <= {30'd0, cfg_side, cfg_armed};
+                        s_axi_rdata <= {29'd0, gap_tripped, cfg_side, cfg_armed};
                     end
                     REG_TRIGGER_PRICE: begin
                         s_axi_rdata <= cfg_trigger_price;
@@ -247,6 +268,9 @@ module tick2trade_csr #(
                     REG_PACKET_LATENCY: begin
                         s_axi_rdata <= packet_latency_cycles;
                     end
+                    REG_SYMBOL_STATE: begin
+                        s_axi_rdata <= {22'd0, symbol_trading, nasdaq_op_halted, trading_state};
+                    end
                     default: begin
                         s_axi_rdata <= '0;
                     end
@@ -277,6 +301,10 @@ module tick2trade_csr #(
         @(posedge clk) disable iff (!rst_n)
         (s_axi_rvalid && !s_axi_rready) |=> s_axi_rvalid
     ) else $error("rvalid dropped too early (not accepted by master)");
+    assert property(
+        @(posedge clk) disable iff (!rst_n)
+        gap_detected |=> !cfg_armed
+    ) else $error("sequence gap didn't trip the kill switch");
 `endif
 
 endmodule

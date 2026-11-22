@@ -20,6 +20,22 @@ static constexpr int MSGS_PER_PACKET = 50;
 
 static std::vector<uint64_t> live_refs;
 
+// a real day opens with an H 'T' for every symbol before any orders (the pre-open spin)
+// the book blocks trading until it sees one, so every file starts with it
+static size_t add_trading_open(uint8_t *dest, uint64_t timestamp){
+    TradingAction act;
+    act.stock_locate = 1;
+    act.tracking_num = 0;
+    act.timestamp = timestamp;
+    act.stock = "AAPL";
+    act.trading_state = 'T';
+    act.reason = "";
+
+    uint8_t buf[TRADING_ACTION_LEN];
+    build_trading_action(buf, act);
+    return build_mold_msg(dest, buf, TRADING_ACTION_LEN);
+}
+
 static void forget_ref(uint64_t ref){
     for (size_t i = 0; i < live_refs.size(); i++){
         if (ref == live_refs[i]){
@@ -41,7 +57,8 @@ static size_t build_random_stream(FILE *f, int num_msgs, unsigned int seed){
 
     srand(seed);
 
-    uint8_t packet[MOLD_HEADER_LEN + MSGS_PER_PACKET * (2 + ORDER_ADD_LEN)];
+    // header + the opening H (1st packet only) + every msg being the longest (an A)
+    uint8_t packet[MOLD_HEADER_LEN + (2 + TRADING_ACTION_LEN) + MSGS_PER_PACKET * (2 + ORDER_ADD_LEN)];
 
     int written = 0;
     while (written < num_msgs){
@@ -49,7 +66,11 @@ static size_t build_random_stream(FILE *f, int num_msgs, unsigned int seed){
         if (num_msgs - written < in_packet) in_packet = num_msgs - written;
 
         size_t n = MOLD_HEADER_LEN;
-        build_mold_header(&packet[0], sequence, (uint16_t)in_packet);
+        int opening_h = (sequence == 1) ? 1 : 0; // the H rides in the 1st packet so packet_count doesn't change
+        build_mold_header(&packet[0], sequence, (uint16_t)(in_packet + opening_h));
+        if (opening_h){
+            n += add_trading_open(&packet[n], timestamp++);
+        }
 
         for (int m = 0; m < in_packet; m++){
             int x = rand() % 100;
@@ -128,7 +149,7 @@ static size_t build_random_stream(FILE *f, int num_msgs, unsigned int seed){
 
         fwrite(packet, 1, n, f);
         total += n;
-        sequence += in_packet;
+        sequence += in_packet + opening_h;
     }
 
     FILE *expected = fopen("expected.txt", "w");
@@ -194,11 +215,12 @@ int main(int argc, char **argv){
     build_order_add(itch_bid, bid);
     build_order_add(itch_ask, ask);
 
-    uint8_t packet[128];
+    uint8_t packet[128]; // 20B header + (2+25)B H + 2 * (2+36)B A = 123B
     size_t n = 0;
 
-    build_mold_header(&packet[0], 1000, 2);
+    build_mold_header(&packet[0], 1000, 3);
     n = MOLD_HEADER_LEN;
+    n += add_trading_open(&packet[n], 500);
     n += build_mold_msg(&packet[n], itch_bid, ORDER_ADD_LEN);
     n += build_mold_msg(&packet[n], itch_ask, ORDER_ADD_LEN);
 

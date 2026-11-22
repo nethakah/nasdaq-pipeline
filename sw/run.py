@@ -29,6 +29,7 @@ REG_FIRE_LATENCY = 0x4C
 REG_LATENCY_MIN = 0x50
 REG_LATENCY_MAX = 0x54
 REG_INGEST_LATENCY = 0x58
+REG_SYMBOL_STATE = 0x5C # [7:0] last H state, [8] Nasdaq op halt, [9] allowed to trade
 
 # program the fpga
 ol = Overlay('tick2trade.bit')
@@ -107,6 +108,11 @@ print(f'fire_count = {csr.read(REG_FIRE_COUNT)}')
 print(f'miss_count = {csr.read(REG_MISS_COUNT)}')
 print(f'overflow_count = {csr.read(REG_OVERFLOW_COUNT)}')
 print(f'level_collision = {csr.read(REG_LEVEL_COLLISION)}')
+
+# blocked until an H 'T' arrives, so if fire_count is 0 check this first
+state = csr.read(REG_SYMBOL_STATE)
+h_state = chr(state & 0xFF) if (state & 0xFF) != 0 else 'none yet'
+print(f'trading_state = {h_state}; nasdaq_op_halt = {(state >> 8) & 1}; allowed_to_trade = {(state >> 9) & 1}')
 
 # hardware timestamps measured in fabric and given over axi-lite
 cycles = csr.read(REG_FIRE_LATENCY)

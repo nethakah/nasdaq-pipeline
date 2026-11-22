@@ -340,8 +340,84 @@ static inline void build_order_replace(uint8_t *dest, const OrderReplace &msg)
     ENSURES(dest[0] == 'U');
 }
 
-// TYPES THE BOOK NEVER USES
-// every non-book ITCH 5.0 type with its length (spec section 1), for testing that the parser skips them
+// alpha fields are ASCII, left-justified and right-padded with spaces (spec: Data Types)
+static inline void write_padded_alpha(uint8_t *dest, const char *text, size_t width){
+    REQUIRES(dest != nullptr);
+    REQUIRES(text != nullptr);
+    //
+
+    std::memset(dest, ' ', width);
+    size_t len = std::strlen(text);
+    if (len > width) len = width;
+    std::memcpy(dest, text, len);
+}
+
+// STOCK TRADING ACTION (H)
+// a symbol's trading state: sent for every symbol before the open (the "spin"), then again whenever it changes
+// no order ref, so it doesn't use build_common_header (the stock symbol sits @11 instead)
+static constexpr size_t TRADING_ACTION_LEN = 25;
+struct TradingAction{
+    uint16_t stock_locate; //@1
+    uint16_t tracking_num; //@3
+    uint64_t timestamp; //@5
+    const char *stock; //@11 8 chars
+    char trading_state; //@19 'T' trading / 'H' halted / 'P' paused / 'Q' quotation only
+    const char *reason; //@21 4 chars, e.g. "T1" (news pending), "MWC1" (circuit breaker), "" (none)
+};
+static inline void build_trading_action(uint8_t *dest, const TradingAction &msg)
+{
+    REQUIRES(dest != nullptr);
+    REQUIRES(msg.stock != nullptr);
+    REQUIRES(msg.reason != nullptr);
+    REQUIRES(msg.timestamp <= 0xFFFFFFFFFFFFULL);
+    //
+
+    dest[0] = 'H';
+    write_u16_bigendian(&dest[1], msg.stock_locate);
+    write_u16_bigendian(&dest[3], msg.tracking_num);
+    write_u48_bigendian(&dest[5], msg.timestamp);
+    write_padded_alpha(&dest[11], msg.stock, 8); //@11
+    dest[19] = (uint8_t)msg.trading_state; //@19
+    dest[20] = ' '; //@20 reserved
+    write_padded_alpha(&dest[21], msg.reason, 4); //@21
+
+    //
+    ENSURES(dest[0] == 'H');
+}
+
+// OPERATIONAL HALT (h)
+// 1 market center (not the whole market) halted or resumed a symbol
+static constexpr size_t OPERATIONAL_HALT_LEN = 21;
+struct OperationalHalt{
+    uint16_t stock_locate; //@1
+    uint16_t tracking_num; //@3
+    uint64_t timestamp; //@5
+    const char *stock; //@11 8 chars
+    char market_code; //@19 'Q' Nasdaq / 'B' BX / 'X' PSX
+    char action; //@20 'H' halted / 'T' resumed
+};
+static inline void build_operational_halt(uint8_t *dest, const OperationalHalt &msg)
+{
+    REQUIRES(dest != nullptr);
+    REQUIRES(msg.stock != nullptr);
+    REQUIRES(msg.timestamp <= 0xFFFFFFFFFFFFULL);
+    //
+
+    dest[0] = 'h';
+    write_u16_bigendian(&dest[1], msg.stock_locate);
+    write_u16_bigendian(&dest[3], msg.tracking_num);
+    write_u48_bigendian(&dest[5], msg.timestamp);
+    write_padded_alpha(&dest[11], msg.stock, 8); //@11
+    dest[19] = (uint8_t)msg.market_code; //@19
+    dest[20] = (uint8_t)msg.action; //@20
+
+    //
+    ENSURES(dest[0] == 'h');
+}
+
+// TYPES THE PIPELINE NEVER USES
+// every ITCH 5.0 type the parser drops, with its length (spec section 1), for testing that it skips them
+// (H and h used to be here, now they gate trading)
 static constexpr size_t ITCH_MAX_MSG_LEN = 50; // longest message is NOII ('I')
 
 struct SkipType{
@@ -349,8 +425,8 @@ struct SkipType{
     size_t len;
 };
 static constexpr SkipType SKIP_TYPES[] = {
-    {'S', 12}, {'R', 39}, {'H', 25}, {'Y', 20}, {'L', 26}, {'V', 35}, {'W', 12}, {'K', 28},
-    {'J', 35}, {'h', 21}, {'P', 44}, {'Q', 40}, {'B', 19}, {'I', 50}, {'N', 20}, {'O', 48}
+    {'S', 12}, {'R', 39}, {'Y', 20}, {'L', 26}, {'V', 35}, {'W', 12}, {'K', 28},
+    {'J', 35}, {'P', 44}, {'Q', 40}, {'B', 19}, {'I', 50}, {'N', 20}, {'O', 48}
 };
 static constexpr size_t NUM_SKIP_TYPES = sizeof(SKIP_TYPES) / sizeof(SKIP_TYPES[0]);
 

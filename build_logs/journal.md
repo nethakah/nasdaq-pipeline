@@ -374,3 +374,27 @@ source fpga/scripts/create_bd.tcl
 - The interesting part is the top 10 levels only ever hold 158 to 474 orders for the busiest symbols, which is 50-235x less than the full book (AMZN: 158 vs 37,068). A full busy book is ~5.4 Mb so only about 5 would fit on chip, but keeping just the top 10 levels' orders on chip and the rest in DRAM would fit hundreds. So tiering is worth it if I want a lot of symbols.
 - Takes about 4 min for the full day.
 - Next: all 23 lengths in the parser, then X and U in the RTL, L3 to URAM, and the ladder to at least 4,227 slots a side (so 8,192).
+
+### log-65: Every ITCH type through the parser (2026-11-21)
+- Put all 23 lengths into `msg_length()` so the parser walks the body of every message, and `decode_type()` gives `MSG_NONE` for whatever the book doesn't use so it just gets dropped at the end of the message.
+- F, C and X needed almost nothing. F is an A through @35 (MPID @36 skipped), C is an E through @30, and X has its cancelled shares @19 just like E's executed shares. In the book X is a partial E with no trade behind it, and the order keeps its place in line.
+- The old RTL lost framing on the first non A/E/D message. New test hides an A, E and D between every skip type (random bodies so some bytes look like type codes) to prove it doesn't anymore.
+
+### log-66: Mutation testing found a useless test (2026-11-21)
+- Started breaking the RTL on purpose to check the tests actually catch things. Put bug-15 back in and the random stall test still passed, since 1 cycle stalls never fill the skid buffer, so the bug-15 path never even ran.
+- Stalls come in bursts now (up to ~1,100 cycles, like a rescan), and bug-15, a missing locate filter, and `>=` vs `>` on the exact fill all get caught. The bursts can't chain back to back though, since the real book is always IDLE for a cycle between messages. The tb has to act like the real downstream, not just be random.
+- Also added the unlikely edge cases: field extremes, junk bytes, reset mid-message, refs 0 and 2^64-1, prices of 1 and $200,000 right next to the empty book markers, and bucket slot reuse.
+
+### log-67: U, order replace (2026-11-21)
+- U means the old order is gone and a new ref takes over at a new price with new TOTAL shares. No side byte since the side can't change, so it comes from the old order. The book does it as a D on the old ref, then loops back as an A on the new ref (8 cycles, plus ~1,024 if it rescans).
+- Between the 2 halves the top of book is something that never existed on the exchange, and `trade_signal` fires on `book_valid`, so it could fire on a book that never existed. `book_valid` stays LO until the add half lands, and still pulses once if the add overflows since the delete already changed the book. An assertion checks it never pulses mid-U.
+- U is 8% of a real day, so rescans are the throughput problem from here.
+
+### log-68: Halts fail closed (2026-11-21)
+- H gives a symbol's state ('T' trading, 'H' halted, 'P' paused, 'Q' quotation only), sent for every symbol before the open and then whenever it changes. h is an operational halt on 1 market center, and only Nasdaq's ('Q') matters since that's where orders would go.
+- Big question was block or allow before I've seen an H. The spec answers it: a symbol missing from the pre-open spin "should be treated as halted." So it's blocked out of reset until an H 'T'. Worst case that way is missing a trade instead of trading a halted stock.
+- Handled in IDLE in 1 cycle and never touches the book. TEST5 (kill switch) started passing for the wrong reason once this went in (nothing fired because there was no H yet), so it sends an H 'T' first now.
+
+### log-69: Gaps trip the kill switch (2026-11-21)
+- A MoldUDP64 gap means lost packets that could've had anything for my symbol, and with no retransmit or snapshot (Nasdaq's GLIMPSE) yet, the book can't be trusted after that. So a gap clears `cfg_armed` and software has to look and re-arm.
+- If a gap and a re-arm land on the same cycle, the gap wins.
