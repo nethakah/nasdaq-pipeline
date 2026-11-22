@@ -48,6 +48,8 @@ module order_book
     book_state_enum state;
     // ADD (4): IDLE -> READ_BUCKET -> FIND_ORDER -> UPDATE
     // E/D (5): IDLE -> READ_BUCKET -> FIND_ORDER -> READ_LEVEL -> UPDATE
+    // U (8): the E/D path on the old ref, then READ_BUCKET -> FIND_ORDER -> UPDATE again as an ADD on the new ref
+    //        (+ RESCAN between the 2 halves if the old order was the last one at the top level)
 
     logic[BUCKET_BITS-1:0] book_mem[NUM_BUCKETS]; // L3 table - 1 read for whole bucket
     logic[LEVEL_BITS-1:0] bid_levels[NUM_LEVELS]; // L2 bids
@@ -64,6 +66,10 @@ module order_book
     logic[31:0] curr_price; // price of order being changed
     logic[31:0] shares_removed; // num of shares that leave this level
     logic order_left; // did order leave book entirely
+
+    // U = delete the old ref, then add the new ref on the same side
+    // HI between the 2 halves (old order is out, new one isn't in yet)
+    logic rpl_pending;
 
     // flat mem needs next value assembled to be written as a word
     bucket_t bucket_next;
@@ -176,6 +182,7 @@ module order_book
             miss_count <= '0;
             level_collision_count <= '0;
             book_valid <= '0;
+            rpl_pending <= '0;
 
             top_bid_shares <= '0;
             top_ask_shares <= '0;
@@ -217,8 +224,9 @@ module order_book
                         curr_is_buy <= bucket_data[match_index].is_buy;
                         curr_level <= hash_price(bucket_data[match_index].price);
 
-                        // if its DEL, or fully filled execute, then remove whole order
-                        if (curr_msg.msg_type == MSG_DEL || curr_msg.shares >= bucket_data[match_index].shares) begin
+                        // if its DEL, a replace (the whole old order goes), or fully filled execute, then remove whole order
+                        // (U's shares are the NEW order's total, so they can't be compared against the old order here)
+                        if (curr_msg.msg_type == MSG_DEL || curr_msg.msg_type == MSG_RPL || curr_msg.shares >= bucket_data[match_index].shares) begin
                             shares_removed <= bucket_data[match_index].shares;
                             order_left <= 1'b1;
                         end
@@ -243,7 +251,9 @@ module order_book
 
                 // every msg writes both things in 1 cycle here
                 UPDATE: begin
-                    state <= IDLE;
+                    // U goes back around to add the new order
+                    // (if the top level emptied, the state <= RESCAN further down wins, since the last <= in a block wins)
+                    state <= (curr_msg.msg_type == MSG_RPL) ? READ_BUCKET : IDLE;
                     case (curr_msg.msg_type)
 
                         MSG_ADD: begin
@@ -314,8 +324,8 @@ module order_book
                             end
                         end
 
-                        // L2 work identical for both E/D
-                        MSG_DEL, MSG_EXC: begin
+                        // L2 work identical for E/D/X and U's delete half (X is just a partial E with no trade behind it)
+                        MSG_DEL, MSG_EXC, MSG_CXL, MSG_RPL: begin
                             // L3 - always_comb assembled bucket_next
                             book_mem[curr_bucket] <= bucket_next;
 
@@ -364,6 +374,26 @@ module order_book
 
                         default: ;
                     endcase
+
+                    // U's add half just finished, so the book is whole again: publish it now
+                    // (pulse even if the add overflowed, since the delete half already changed the book)
+                    if (rpl_pending) begin
+                        rpl_pending <= '0;
+                        book_valid <= 1'b1;
+                    end
+
+                    // U's delete half just ran above, so turn curr_msg into the add half
+                    if (curr_msg.msg_type == MSG_RPL) begin
+                        curr_msg.msg_type <= MSG_ADD;
+                        curr_msg.order_ref_num <= curr_msg.new_order_ref_num;
+                        curr_msg.is_buy <= curr_is_buy; // U carries no side, the new order takes the old order's side
+                        curr_bucket <= hash_order_ref(curr_msg.new_order_ref_num);
+                        rpl_pending <= 1'b1;
+
+                        // don't publish the half-done book (old order out, new one not in yet)
+                        // trade_signal acts on book_valid, so it could fire on a top of book that never existed on the exchange
+                        book_valid <= '0;
+                    end
                 end
 
                 RESCAN: begin
@@ -390,8 +420,9 @@ module order_book
                             top_ask_price <= rescan_best_price;
                         end
 
-                        state <= IDLE;
-                        book_valid <= 1'b1;
+                        // a U still has its add half to do (and it publishes once that lands)
+                        state <= rpl_pending ? READ_BUCKET : IDLE;
+                        book_valid <= !rpl_pending;
                     end
 
                     else begin // increment scan
@@ -411,14 +442,23 @@ module order_book
             @(posedge clk) disable iff (!rst_n)
             (best_bid_price != '0 && best_ask_price != 32'hFFFFFFFF) |-> (best_ask_price > best_bid_price)
         ) else $error("book published a crossed market (bid is at or above ask - not possible)");
+        // mid-U the top can move with no pulse yet (it gets published when the add half lands)
         assert property(
             @(posedge clk) disable iff (!rst_n)
-            !$stable(best_ask_price) |-> book_valid
+            !$stable(best_ask_price) |-> (book_valid || rpl_pending)
         ) else $error("ask changed w/o book update");
         assert property(
             @(posedge clk) disable iff (!rst_n)
-            !$stable(best_bid_price) |-> book_valid
+            !$stable(best_bid_price) |-> (book_valid || rpl_pending)
         ) else $error("bid changed w/o book update");
+        assert property(
+            @(posedge clk) disable iff (!rst_n)
+            rpl_pending |-> (state != IDLE)
+        ) else $error("another msg could get in between a U's delete and add halves");
+        assert property(
+            @(posedge clk) disable iff (!rst_n)
+            book_valid |-> !rpl_pending
+        ) else $error("published a half-done U");
         assert property(
             @(posedge clk) disable iff (!rst_n)
             miss_count >= $past(miss_count)

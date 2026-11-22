@@ -14,7 +14,7 @@ module itch_parser
     output logic      s_axis_tready, // us: always 1 for now (we can always accept 1 byte)
 
     // Master - parsed msg out
-    output msg_t      m_axis_tdata, // 325b packed msg
+    output msg_t      m_axis_tdata, // 448b packed msg
     output logic      m_axis_tvalid, // us: bundle is valid
     input logic       m_axis_tready // downstream (orderbook): it can accept stuff
 );
@@ -55,17 +55,19 @@ module itch_parser
             if (s_axis_tvalid && s_axis_tready) begin
                 case (state)
                     READ_TYPE: begin
-                        if (msg_length(s_axis_tdata) != 6'd0) begin // recognized type
+                        // every ITCH 5.0 type has a length, so we walk the body of ALL of them
+                        // (decode_type gives MSG_NONE for the ones the book doesn't use, so they get dropped at the end)
+                        if (msg_length(s_axis_tdata) != 6'd0) begin
                             fsm_tdata.msg_type <= decode_type(s_axis_tdata);
                             curr_len <= msg_length(s_axis_tdata);
                             byte_index <= 6'd1;
                             state <= READ_BODY;
                         end
-                        // else not recognized; stay in READ_TYPE (CHANGE IN V2!)
+                        // else not an ITCH 5.0 type at all, stay in READ_TYPE (only happens if framing is already lost)
                     end
 
                     READ_BODY: begin
-                        // identical for A/E/D
+                        // identical for every message type (bytes 1-18)
                         case (byte_index)
                             // Stock locate @1 (2B)
                             6'd1: fsm_tdata.stock_locate[15:8] <= s_axis_tdata;
@@ -127,7 +129,9 @@ module itch_parser
                                 endcase
                             end
 
-                            MSG_EXC: begin
+                            // X's cancelled shares sit @19 just like E's executed shares
+                            // X is only 23B long so it ends before the match num @23 (which X doesn't have)
+                            MSG_EXC, MSG_CXL: begin
                                 case (byte_index)
                                     6'd19: fsm_tdata.shares[31:24] <= s_axis_tdata;
                                     6'd20: fsm_tdata.shares[23:16] <= s_axis_tdata;
@@ -148,6 +152,36 @@ module itch_parser
                                 endcase
                             end
 
+                            // U: the ORIGINAL ref @11 already landed in order_ref_num above
+                            // no side on the wire, the book keeps the old order's side
+                            MSG_RPL: begin
+                                case (byte_index)
+                                    // New order ref num @19 (8B)
+                                    6'd19: fsm_tdata.new_order_ref_num[63:56] <= s_axis_tdata;
+                                    6'd20: fsm_tdata.new_order_ref_num[55:48] <= s_axis_tdata;
+                                    6'd21: fsm_tdata.new_order_ref_num[47:40] <= s_axis_tdata;
+                                    6'd22: fsm_tdata.new_order_ref_num[39:32] <= s_axis_tdata;
+                                    6'd23: fsm_tdata.new_order_ref_num[31:24] <= s_axis_tdata;
+                                    6'd24: fsm_tdata.new_order_ref_num[23:16] <= s_axis_tdata;
+                                    6'd25: fsm_tdata.new_order_ref_num[15:8] <= s_axis_tdata;
+                                    6'd26: fsm_tdata.new_order_ref_num[7:0] <= s_axis_tdata;
+
+                                    // Shares @27 (4B) (the new TOTAL, not a change like E/X)
+                                    6'd27: fsm_tdata.shares[31:24] <= s_axis_tdata;
+                                    6'd28: fsm_tdata.shares[23:16] <= s_axis_tdata;
+                                    6'd29: fsm_tdata.shares[15:8] <= s_axis_tdata;
+                                    6'd30: fsm_tdata.shares[7:0] <= s_axis_tdata;
+
+                                    // Price @31 (4B)
+                                    6'd31: fsm_tdata.price[31:24] <= s_axis_tdata;
+                                    6'd32: fsm_tdata.price[23:16] <= s_axis_tdata;
+                                    6'd33: fsm_tdata.price[15:8] <= s_axis_tdata;
+                                    6'd34: fsm_tdata.price[7:0] <= s_axis_tdata;
+
+                                    default: ;
+                                endcase
+                            end
+
                             MSG_DEL: ;
                             MSG_NONE: ;
                             default: ;
@@ -155,7 +189,10 @@ module itch_parser
                         
                         // curr_len = total bytes
                         if (byte_index == curr_len - 6'd1) begin
-                            fsm_tvalid <= 1'b1;
+                            // only hand the book what changes it; S, R, P, etc. are consumed and dropped here
+                            if (fsm_tdata.msg_type != MSG_NONE) begin
+                                fsm_tvalid <= 1'b1;
+                            end
                             state <= READ_TYPE;
                         end else begin
                             byte_index <= byte_index + 6'd1;

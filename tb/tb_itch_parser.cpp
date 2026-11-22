@@ -13,7 +13,7 @@ verilator --cc --exe --build -j 0  --assert +define+SIM --top-module itch_parser
 #include "itch_messages.hpp"
 
 static constexpr int RESET_CYCLES = 5; // constexpr is C++ for eval this at compile time, not run time
-static constexpr int TDATA_WORDS = 12; // 384b = 12 words * 32 bits
+static constexpr int TDATA_WORDS = 14; // 448b = 14 words * 32 bits
 
 static int failures = 0;
 
@@ -54,6 +54,9 @@ static void reset(Vitch_parser *dut){
 
 
 /*
+word 13,12:
+new_order_ref (64b) - 447:384
+
 word11:
 rsvd0 (27b) - 383:357
 is_buy (1b) - 356
@@ -84,6 +87,13 @@ match_num (64b) - 63:0
 */
 
 // extract from padding
+static inline uint64_t get_new_order_ref(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    REQUIRES(dut->m_axis_tvalid);
+    //
+
+    return ((uint64_t)dut->m_axis_tdata[13] << 32) | dut->m_axis_tdata[12];
+}
 static inline uint64_t get_match_num(Vitch_parser *dut){
     REQUIRES(dut != nullptr);
     REQUIRES(dut->m_axis_tvalid);
@@ -258,6 +268,8 @@ static constexpr uint8_t MSG_NONE = 0;
 static constexpr uint8_t MSG_ADD  = 1;
 static constexpr uint8_t MSG_EXC  = 2;
 static constexpr uint8_t MSG_DEL  = 3;
+static constexpr uint8_t MSG_CXL  = 4;
+static constexpr uint8_t MSG_RPL  = 5;
 
 static void check(uint64_t actual, uint64_t expected, const char* name){
     REQUIRES(name != nullptr);
@@ -370,6 +382,457 @@ static void test_order_delete(Vitch_parser *dut){
     check(get_locate(dut), del.stock_locate, "stock_locate");
     check(get_timestamp(dut), del.timestamp, "timestamp");
     check(get_order_ref(dut), del.order_ref_num, "order_ref_num");
+}
+
+static void test_add_mpid(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Add Order w/ MPID (F)\n");
+    reset(dut);
+
+    OrderAdd add;
+    add.stock_locate = 1;
+    add.tracking_num = 1;
+    add.timestamp = 1000;
+    add.order_ref_num = 101;
+    add.is_buy = false;
+    add.shares = 700;
+    add.stock = "AAPL";
+    add.price = 1500100; // $150.0100
+
+    uint8_t msg[ORDER_ADD_MPID_LEN];
+    build_order_add_mpid(msg, add, "GSCO");
+    send_msg(dut, msg, ORDER_ADD_MPID_LEN);
+
+    int waited = wait_for_msg(dut);
+    if (waited < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+
+    // F comes out looking exactly like an A (the MPID isn't kept)
+    check(get_msg_type(dut), MSG_ADD, "msg_type");
+    check(get_is_buy(dut), add.is_buy, "is_buy");
+    check(get_locate(dut), add.stock_locate, "stock_locate");
+    check(get_timestamp(dut), add.timestamp, "timestamp");
+    check(get_order_ref(dut), add.order_ref_num, "order_ref_num");
+    check(get_shares(dut), add.shares, "shares");
+    check(get_stock(dut), ticker_to_u64(add.stock), "stock");
+    check(get_price(dut), add.price, "price");
+}
+
+static void test_executed_price(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Order Executed w/ Price (C)\n");
+    reset(dut);
+
+    OrderExecutedPrice exc;
+    exc.stock_locate = 1;
+    exc.tracking_num = 2;
+    exc.timestamp = 2000;
+    exc.order_ref_num = 101;
+    exc.shares = 300;
+    exc.match_num = 56;
+    exc.printable = true;
+    exc.exec_price = 1499900; // $149.9900 (different from the resting price on purpose)
+
+    uint8_t msg[ORDER_EXECUTED_PRICE_LEN];
+    build_order_executed_price(msg, exc);
+    send_msg(dut, msg, ORDER_EXECUTED_PRICE_LEN);
+
+    int waited = wait_for_msg(dut);
+    if (waited < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+
+    // C comes out looking exactly like an E (the book only needs the shares)
+    check(get_msg_type(dut), MSG_EXC, "msg_type");
+    check(get_locate(dut), exc.stock_locate, "stock_locate");
+    check(get_timestamp(dut), exc.timestamp, "timestamp");
+    check(get_order_ref(dut), exc.order_ref_num, "order_ref_num");
+    check(get_shares(dut), exc.shares, "shares");
+    check(get_match_num(dut), exc.match_num, "match_num");
+}
+
+static void test_order_cancel(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Order Cancel (X)\n");
+    reset(dut);
+
+    OrderCancel cxl;
+    cxl.stock_locate = 1;
+    cxl.tracking_num = 4;
+    cxl.timestamp = 4000;
+    cxl.order_ref_num = 102;
+    cxl.cancelled_shares = 400;
+
+    uint8_t msg[ORDER_CANCEL_LEN];
+    build_order_cancel(msg, cxl);
+    send_msg(dut, msg, ORDER_CANCEL_LEN);
+
+    int waited = wait_for_msg(dut);
+    if (waited < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+
+    check(get_msg_type(dut), MSG_CXL, "msg_type");
+    check(get_locate(dut), cxl.stock_locate, "stock_locate");
+    check(get_timestamp(dut), cxl.timestamp, "timestamp");
+    check(get_order_ref(dut), cxl.order_ref_num, "order_ref_num");
+    check(get_shares(dut), cxl.cancelled_shares, "shares");
+}
+
+static void test_order_replace(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Order Replace (U)\n");
+    reset(dut);
+
+    OrderReplace rpl;
+    rpl.stock_locate = 1;
+    rpl.tracking_num = 5;
+    rpl.timestamp = 5000;
+    rpl.orig_order_ref_num = 102;
+    rpl.new_order_ref_num = 0x0000000200000001ULL; // > 32b so both halves of the field get checked
+    rpl.shares = 750;
+    rpl.price = 1231500;
+
+    uint8_t msg[ORDER_REPLACE_LEN];
+    build_order_replace(msg, rpl);
+    send_msg(dut, msg, ORDER_REPLACE_LEN);
+
+    int waited = wait_for_msg(dut);
+    if (waited < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+
+    check(get_msg_type(dut), MSG_RPL, "msg_type");
+    check(get_locate(dut), rpl.stock_locate, "stock_locate");
+    check(get_timestamp(dut), rpl.timestamp, "timestamp");
+    check(get_order_ref(dut), rpl.orig_order_ref_num, "orig ref");
+    check(get_new_order_ref(dut), rpl.new_order_ref_num, "new ref");
+    check(get_shares(dut), rpl.shares, "shares @27");
+    check(get_price(dut), rpl.price, "price @31");
+}
+
+static void test_skip_non_book(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Every non-book type gets skipped (A, E, D hidden between them)\n");
+    reset(dut);
+    srand(777); // the skip bodies are random bytes; fixed seed so a failure reproduces
+
+    OrderAdd add;
+    add.stock_locate = 1;
+    add.tracking_num = 1;
+    add.timestamp = 1000;
+    add.order_ref_num = 200;
+    add.is_buy = true;
+    add.shares = 400;
+    add.stock = "MSFT";
+    add.price = 1500000;
+
+    OrderExecuted exc;
+    exc.stock_locate = 1;
+    exc.tracking_num = 2;
+    exc.timestamp = 2000;
+    exc.order_ref_num = 200;
+    exc.shares = 100;
+    exc.match_num = 57;
+
+    OrderDelete del;
+    del.stock_locate = 1;
+    del.tracking_num = 3;
+    del.timestamp = 3000;
+    del.order_ref_num = 200;
+
+    // all 16 skip types, with the A after the 5th, the E after the 10th, the D at the very end
+    uint8_t stream[NUM_SKIP_TYPES * ITCH_MAX_MSG_LEN + ORDER_ADD_LEN + ORDER_EXECUTED_LEN + ORDER_DELETE_LEN];
+    size_t n = 0;
+    for (size_t i = 0; i < NUM_SKIP_TYPES; i++){
+        build_skip_msg(&stream[n], SKIP_TYPES[i]);
+        n += SKIP_TYPES[i].len;
+
+        if (i == 4){
+            build_order_add(&stream[n], add);
+            n += ORDER_ADD_LEN;
+        }
+        if (i == 9){
+            build_order_executed(&stream[n], exc);
+            n += ORDER_EXECUTED_LEN;
+        }
+    }
+    build_order_delete(&stream[n], del);
+    n += ORDER_DELETE_LEN;
+
+    // To remember what came out
+    struct CapturedMsg{
+        uint8_t msg_type;
+        uint64_t order_ref;
+        uint32_t shares;
+    };
+    CapturedMsg captured[4]; // 1 more slot than we expect, so an extra message gets caught
+    int num_captured = 0;
+
+    for (size_t i = 0; i < n; i++){
+        bool got = false;
+        uint8_t t = 0;
+        uint64_t r = 0;
+        uint32_t s = 0;
+
+        feed_byte(dut, stream[i], &got, &t, &r, &s);
+
+        if (got && num_captured<4){
+            captured[num_captured].msg_type = t;
+            captured[num_captured].order_ref = r;
+            captured[num_captured].shares = s;
+            num_captured++;
+        }
+    }
+
+    // drain w no input (the D is still in flight when its last byte lands)
+    dut->s_axis_tvalid = 0;
+    for (int i = 0; i<10 && num_captured<4; i++){
+        dut->eval();
+
+        if (dut->m_axis_tvalid && num_captured<4){
+            captured[num_captured].msg_type = get_msg_type(dut);
+            captured[num_captured].order_ref = get_order_ref(dut);
+            captured[num_captured].shares = get_shares(dut);
+            num_captured++;
+        }
+
+        tick(dut);
+    }
+
+    check(num_captured, 3, "only A, E, D come out");
+    if (num_captured != 3) return;
+
+    check(captured[0].msg_type, MSG_ADD, "msg0type");
+    check(captured[0].order_ref, add.order_ref_num, "msg0order_ref");
+    check(captured[0].shares, add.shares, "msg0shares");
+
+    check(captured[1].msg_type, MSG_EXC, "msg1type");
+    check(captured[1].order_ref, exc.order_ref_num, "msg1order_ref");
+    check(captured[1].shares, exc.shares, "msg1shares");
+
+    check(captured[2].msg_type, MSG_DEL, "msg2type");
+    check(captured[2].order_ref, del.order_ref_num, "msg2order_ref");
+}
+
+// counts msgs coming out while the input sits idle (catches an extra msg nobody expected)
+static int drain_count(Vitch_parser *dut, int cycles = 20){
+    REQUIRES(dut != nullptr);
+    //
+
+    int count = 0;
+    dut->s_axis_tvalid = 0;
+    for (int i = 0; i < cycles; i++){
+        dut->eval();
+        if (dut->m_axis_tvalid && dut->m_axis_tready){
+            count++;
+        }
+        tick(dut);
+    }
+    return count;
+}
+
+// EDGE: every field at its max, then every field at 0
+// (catches truncation, a missed byte, or bytes landing in the wrong half of a field)
+static void test_field_extremes(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Edge - every field at max, then every field at 0\n");
+    reset(dut);
+
+    OrderAdd hi;
+    hi.stock_locate = 0xFFFF; // 16b max
+    hi.tracking_num = 0xFFFF;
+    hi.timestamp = 0xFFFFFFFFFFFFULL; // 48b max
+    hi.order_ref_num = 0xFFFFFFFFFFFFFFFFULL; // 64b max
+    hi.is_buy = true;
+    hi.shares = 0xFFFFFFFF; // 32b max
+    hi.stock = "ZZZZZZZZ"; // all 8 chars used, no padding
+    hi.price = 0xFFFFFFFF;
+
+    uint8_t msg[ORDER_ADD_LEN];
+    build_order_add(msg, hi);
+    send_msg(dut, msg, ORDER_ADD_LEN);
+
+    if (wait_for_msg(dut) < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+    check(get_locate(dut), hi.stock_locate, "max locate");
+    check(get_timestamp(dut), hi.timestamp, "max timestamp");
+    check(get_order_ref(dut), hi.order_ref_num, "max order_ref");
+    check(get_shares(dut), hi.shares, "max shares");
+    check(get_stock(dut), ticker_to_u64(hi.stock), "8-char stock");
+    check(get_price(dut), hi.price, "max price");
+    check(drain_count(dut), 1, "exactly 1 msg out"); // the one we're holding is still offered
+
+    reset(dut);
+
+    OrderExecuted lo;
+    lo.stock_locate = 0;
+    lo.tracking_num = 0;
+    lo.timestamp = 0;
+    lo.order_ref_num = 0;
+    lo.shares = 0;
+    lo.match_num = 0;
+
+    uint8_t msg_lo[ORDER_EXECUTED_LEN];
+    build_order_executed(msg_lo, lo);
+    send_msg(dut, msg_lo, ORDER_EXECUTED_LEN);
+
+    if (wait_for_msg(dut) < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+    check(get_msg_type(dut), MSG_EXC, "all-0 E still decodes");
+    check(get_locate(dut), 0, "0 locate");
+    check(get_timestamp(dut), 0, "0 timestamp");
+    check(get_order_ref(dut), 0, "0 order_ref");
+    check(get_shares(dut), 0, "0 shares");
+    check(get_match_num(dut), 0, "0 match_num (all 1s from the last msg got overwritten)");
+}
+
+// EDGE: bytes that aren't any ITCH type (only shows up if framing is already lost)
+// parser should sit in READ_TYPE eating them, then lock back on at the next real type byte
+static void test_garbage_then_resync(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Edge - non-ITCH bytes get eaten, next real msg still parses\n");
+    reset(dut);
+
+    // none of these are in the 23-type table (lowercase 'a' isn't a type, only 'h' is)
+    const uint8_t garbage[] = {0x00, 0xFF, 'Z', 'a', '0', ' '};
+    send_msg(dut, garbage, sizeof(garbage));
+    check(drain_count(dut), 0, "garbage makes no msgs");
+
+    OrderAdd add;
+    add.stock_locate = 1;
+    add.tracking_num = 1;
+    add.timestamp = 1000;
+    add.order_ref_num = 300;
+    add.is_buy = true;
+    add.shares = 100;
+    add.stock = "AAPL";
+    add.price = 1500000;
+
+    uint8_t msg[ORDER_ADD_LEN];
+    build_order_add(msg, add);
+    send_msg(dut, msg, ORDER_ADD_LEN);
+
+    if (wait_for_msg(dut) < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+    check(get_msg_type(dut), MSG_ADD, "resynced on the A");
+    check(get_order_ref(dut), add.order_ref_num, "order_ref after garbage");
+    check(get_price(dut), add.price, "price after garbage");
+}
+
+// EDGE: worst-case skip, the longest msg ('I', 50B) with a body that's ALL type codes
+// if the parser ever looked at a body byte as a type, this would spawn fake A's
+static void test_skip_body_all_type_codes(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Edge - 50B skip msg whose body is all 'A' bytes\n");
+    reset(dut);
+
+    uint8_t noii[50]; // 'I' is 50B, the longest ITCH msg
+    noii[0] = 'I';
+    for (int i = 1; i < 50; i++){
+        noii[i] = 'A';
+    }
+    send_msg(dut, noii, sizeof(noii));
+    check(drain_count(dut), 0, "no fake A's out of the NOII body");
+
+    OrderDelete del;
+    del.stock_locate = 1;
+    del.tracking_num = 1;
+    del.timestamp = 1000;
+    del.order_ref_num = 301;
+
+    uint8_t msg[ORDER_DELETE_LEN];
+    build_order_delete(msg, del);
+    send_msg(dut, msg, ORDER_DELETE_LEN);
+
+    if (wait_for_msg(dut) < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+    check(get_msg_type(dut), MSG_DEL, "D right after the NOII");
+    check(get_order_ref(dut), del.order_ref_num, "D's order_ref");
+}
+
+// EDGE: reset lands in the middle of a msg
+// the half-read A must vanish and the next msg has to start clean
+static void test_reset_mid_message(Vitch_parser *dut){
+    REQUIRES(dut != nullptr);
+    //
+
+    std::printf("TESTING: Edge - reset in the middle of a msg\n");
+    reset(dut);
+
+    OrderAdd add;
+    add.stock_locate = 1;
+    add.tracking_num = 1;
+    add.timestamp = 1000;
+    add.order_ref_num = 400;
+    add.is_buy = true;
+    add.shares = 100;
+    add.stock = "AAPL";
+    add.price = 1500000;
+
+    uint8_t half[ORDER_ADD_LEN];
+    build_order_add(half, add);
+    send_msg(dut, half, ORDER_ADD_LEN / 2); // stop at byte 18, halfway through
+    reset(dut);
+
+    OrderExecuted exc;
+    exc.stock_locate = 1;
+    exc.tracking_num = 2;
+    exc.timestamp = 2000;
+    exc.order_ref_num = 401;
+    exc.shares = 50;
+    exc.match_num = 9;
+
+    uint8_t msg[ORDER_EXECUTED_LEN];
+    build_order_executed(msg, exc);
+    send_msg(dut, msg, ORDER_EXECUTED_LEN);
+
+    if (wait_for_msg(dut) < 0){
+        std::printf("FAILED (no message emitted within timeout period)");
+        failures++;
+        return;
+    }
+    check(get_msg_type(dut), MSG_EXC, "E parsed clean after reset");
+    check(get_order_ref(dut), exc.order_ref_num, "E's order_ref");
+    check(get_shares(dut), exc.shares, "E's shares");
+    check(drain_count(dut), 1, "only the E (no leftover from the half A)");
 }
 
 static void test_back2back(Vitch_parser *dut){
@@ -604,37 +1067,136 @@ struct Expected{
     uint64_t stock;
     uint32_t price;
     uint64_t match_num;
+    uint64_t new_order_ref_num;
 };
-static void test_random_stream(Vitch_parser *dut, int num_msgs, unsigned int seed){
+// every field the parser produced for this msg type has to match what we built
+static void check_expected(Vitch_parser *dut, const Expected &e){
+    REQUIRES(dut != nullptr);
+    //
+
+    check(get_msg_type(dut), e.msg_type, "type");
+    check(get_locate(dut), e.stock_locate, "locate");
+    check(get_timestamp(dut), e.timestamp, "timestamp");
+    check(get_order_ref(dut), e.order_ref_num, "order_ref");
+
+    if (e.msg_type == MSG_ADD){
+        check(get_is_buy(dut), e.is_buy, "is_buy");
+        check(get_shares(dut), e.shares, "shares");
+        check(get_stock(dut), e.stock, "stock");
+        check(get_price(dut), e.price, "price");
+    }
+    else if (e.msg_type == MSG_EXC){
+        check(get_shares(dut), e.shares, "shares");
+        check(get_match_num(dut), e.match_num, "match_num");
+    }
+    else if (e.msg_type == MSG_CXL){
+        check(get_shares(dut), e.shares, "shares");
+    }
+    else if (e.msg_type == MSG_RPL){
+        check(get_new_order_ref(dut), e.new_order_ref_num, "new_ref");
+        check(get_shares(dut), e.shares, "shares");
+        check(get_price(dut), e.price, "price");
+    }
+}
+
+// cycles left in the current book stall (the book holds tready low in bursts, not single cycles:
+// 4-5 cycles per msg normally, and ~1024 when a top level empties and it rescans the ladder)
+static int stall_left = 0;
+// the book is always IDLE (tready high) for at least 1 cycle between msgs, so stalls never chain
+static bool last_ready = true;
+
+// one clock of the random stream:
+// maybe start/continue a book stall, check any msg handed off this cycle, then tick
+// returns whether the byte on the input got accepted this cycle
+static bool random_stream_cycle(
+    Vitch_parser *dut,
+    const Expected *expected,
+    int num_expected,
+    int *num_seen,
+    int stall_pct,
+    int max_stall
+){
+    REQUIRES(dut != nullptr);
+    REQUIRES(num_seen != nullptr);
+    //
+
+    if (stall_left == 0 && last_ready && (rand() % 100) < stall_pct){
+        stall_left = 1 + (rand() % max_stall); // 1..max_stall cycles
+    }
+    if (stall_left > 0){
+        dut->m_axis_tready = 0;
+        stall_left--;
+    }
+    else{
+        dut->m_axis_tready = 1;
+    }
+    last_ready = dut->m_axis_tready;
+    dut->eval();
+
+    bool accepted = dut->s_axis_tvalid && dut->s_axis_tready;
+
+    // a handoff can happen on ANY cycle (incl. bubbles), so check every cycle, not once per byte
+    if (dut->m_axis_tvalid && dut->m_axis_tready){
+        if (*num_seen < num_expected){
+            check_expected(dut, expected[*num_seen]);
+        }
+        (*num_seen)++; // counted even past the end, so an extra msg shows up in the final count
+    }
+
+    tick(dut);
+    return accepted;
+}
+
+// bubble_pct = % of bytes that arrive after 1-3 idle input cycles
+// stall_pct = % of cycles a book stall (backpressure) starts, lasting 1..max_stall cycles
+static void test_random_stream(
+    Vitch_parser *dut,
+    int num_msgs,
+    unsigned int seed,
+    int bubble_pct = 0,
+    int stall_pct = 0,
+    int max_stall = 1
+){
     REQUIRES(dut != nullptr);
     REQUIRES(num_msgs >= 0);
     //
 
-    std::printf("TESTING: Randomized stream (%d messages, seed %u)\n", num_msgs, seed);
+    std::printf("TESTING: Randomized stream (%d messages, seed %u, %d%% input bubbles, %d%% stall starts up to %d cycles)\n",
+                num_msgs, seed, bubble_pct, stall_pct, max_stall);
     reset(dut);
     srand(seed); // for reproducibility
 
     static const char *tickers[] = {"AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"};
 
-    uint8_t *stream = new uint8_t[num_msgs*ORDER_ADD_LEN];
+    uint8_t *stream = new uint8_t[num_msgs*ITCH_MAX_MSG_LEN]; // room for every msg being the longest
     Expected *expected = new Expected[num_msgs];
+    int num_expected = 0; // skipped msgs don't come out, so this ends up < num_msgs
     size_t stream_len = 0;
 
     for (int i = 0; i < num_msgs; i++){
-        INVARIANT(stream_len <= (size_t)num_msgs * ORDER_ADD_LEN);
+        INVARIANT(stream_len <= (size_t)num_msgs * ITCH_MAX_MSG_LEN);
         
-        int which = rand() % 3; 
-        // 0=add, 1=exc; 2=del
+        int which = rand() % 8; 
+        // 0=add, 1=exc; 2=del; 3=add w/ MPID (F); 4=exc w/ price (C); 5=non-book msg (skipped); 6=cancel (X); 7=replace (U)
+
+        if (which==5){
+            const SkipType &t = SKIP_TYPES[rand() % NUM_SKIP_TYPES];
+            build_skip_msg(&stream[stream_len], t);
+            stream_len += t.len;
+            continue; // nothing expected out
+        }
 
         uint16_t locate = rand_u16();
         uint64_t timestamp = rand_u64() & 0xFFFFFFFFFFFFULL;
         uint64_t order_ref = rand_u64();
 
-        expected[i].stock_locate = locate;
-        expected[i].timestamp = timestamp;
-        expected[i].order_ref_num = order_ref;
+        Expected &e = expected[num_expected];
+        num_expected++;
+        e.stock_locate = locate;
+        e.timestamp = timestamp;
+        e.order_ref_num = order_ref;
 
-        if (which==0){
+        if (which==0 || which==3){
             OrderAdd s;
             s.stock_locate = locate;
             s.tracking_num = rand_u16();
@@ -645,14 +1207,20 @@ static void test_random_stream(Vitch_parser *dut, int num_msgs, unsigned int see
             s.stock = tickers[rand() % 5];
             s.price = rand_u32();
 
-            build_order_add(&stream[stream_len], s);
-            stream_len += ORDER_ADD_LEN;
+            if (which==0){
+                build_order_add(&stream[stream_len], s);
+                stream_len += ORDER_ADD_LEN;
+            }
+            else{
+                build_order_add_mpid(&stream[stream_len], s, "GSCO");
+                stream_len += ORDER_ADD_MPID_LEN;
+            }
 
-            expected[i].msg_type = MSG_ADD;
-            expected[i].is_buy = s.is_buy;
-            expected[i].shares = s.shares;
-            expected[i].stock = ticker_to_u64(s.stock);
-            expected[i].price = s.price;
+            e.msg_type = MSG_ADD; // F comes out as an A
+            e.is_buy = s.is_buy;
+            e.shares = s.shares;
+            e.stock = ticker_to_u64(s.stock);
+            e.price = s.price;
         }
         else if (which==1){
             OrderExecuted s;
@@ -666,9 +1234,59 @@ static void test_random_stream(Vitch_parser *dut, int num_msgs, unsigned int see
             build_order_executed(&stream[stream_len], s);
             stream_len += ORDER_EXECUTED_LEN;
 
-            expected[i].msg_type = MSG_EXC;
-            expected[i].shares = s.shares;
-            expected[i].match_num = s.match_num;
+            e.msg_type = MSG_EXC;
+            e.shares = s.shares;
+            e.match_num = s.match_num;
+        }
+        else if (which==4){
+            OrderExecutedPrice s;
+            s.stock_locate = locate;
+            s.tracking_num = rand_u16();
+            s.timestamp = timestamp;
+            s.order_ref_num = order_ref;
+            s.shares = rand_u32();
+            s.match_num = rand_u64();
+            s.printable = (rand() % 2) != 0;
+            s.exec_price = rand_u32();
+
+            build_order_executed_price(&stream[stream_len], s);
+            stream_len += ORDER_EXECUTED_PRICE_LEN;
+
+            e.msg_type = MSG_EXC; // C comes out as an E
+            e.shares = s.shares;
+            e.match_num = s.match_num;
+        }
+        else if (which==6){
+            OrderCancel s;
+            s.stock_locate = locate;
+            s.tracking_num = rand_u16();
+            s.timestamp = timestamp;
+            s.order_ref_num = order_ref;
+            s.cancelled_shares = rand_u32();
+
+            build_order_cancel(&stream[stream_len], s);
+            stream_len += ORDER_CANCEL_LEN;
+
+            e.msg_type = MSG_CXL;
+            e.shares = s.cancelled_shares;
+        }
+        else if (which==7){
+            OrderReplace s;
+            s.stock_locate = locate;
+            s.tracking_num = rand_u16();
+            s.timestamp = timestamp;
+            s.orig_order_ref_num = order_ref;
+            s.new_order_ref_num = rand_u64();
+            s.shares = rand_u32();
+            s.price = rand_u32();
+
+            build_order_replace(&stream[stream_len], s);
+            stream_len += ORDER_REPLACE_LEN;
+
+            e.msg_type = MSG_RPL;
+            e.new_order_ref_num = s.new_order_ref_num;
+            e.shares = s.shares;
+            e.price = s.price;
         }
         else{ // which==2
             OrderDelete s;
@@ -680,66 +1298,50 @@ static void test_random_stream(Vitch_parser *dut, int num_msgs, unsigned int see
             build_order_delete(&stream[stream_len], s);
             stream_len += ORDER_DELETE_LEN;
 
-            expected[i].msg_type = MSG_DEL;  
+            e.msg_type = MSG_DEL;  
         }
     }
 
     int num_seen = 0;
     int local_failures = failures;
+    stall_left = 0;
+    last_ready = true;
 
     for (size_t i = 0; i < stream_len; i++){
+        // bubble: upstream has nothing for 1-3 cycles before this byte (DMA/FIFO hiccup)
+        if ((rand() % 100) < bubble_pct){
+            dut->s_axis_tvalid = 0;
+            int idle = 1 + (rand() % 3);
+            for (int c = 0; c < idle; c++){
+                random_stream_cycle(dut, expected, num_expected, &num_seen, stall_pct, max_stall);
+            }
+        }
+
         dut->s_axis_tdata = stream[i];
         dut->s_axis_tvalid = 1;
 
-        bool captured_curr_byte = false;
-
-        for (int wait = 0; wait < 100; wait++){
-            dut->eval();
-            bool accepted = dut->s_axis_tready;
-            if (dut->m_axis_tvalid && dut->m_axis_tready && !captured_curr_byte && num_seen<num_msgs){
-                captured_curr_byte = true;
-                const Expected &e = expected[num_seen];
-                
-                check(get_msg_type(dut), e.msg_type, "type");
-                check(get_locate(dut), e.stock_locate, "locate");
-                check(get_timestamp(dut), e.timestamp, "timestamp");
-                check(get_order_ref(dut), e.order_ref_num, "order_ref");
-                
-                if (e.msg_type == MSG_ADD){
-                    check(get_is_buy(dut), e.is_buy, "is_buy");
-                    check(get_shares(dut), e.shares, "shares");
-                    check(get_stock(dut), e.stock, "stock");
-                    check(get_price(dut), e.price, "price");
-                } 
-                
-                else if (e.msg_type == MSG_EXC){
-                    check(get_shares(dut), e.shares, "shares");
-                    check(get_match_num(dut), e.match_num, "match_num");
-                }
-                
-                num_seen++;
-            }
-
-            tick(dut);
-            if (accepted){
-                break;
-            }
+        bool accepted = false;
+        // a byte can legitimately wait out a whole stall, so the limit is the longest stall + 100
+        int max_wait = max_stall + 100;
+        for (int wait = 0; wait < max_wait && !accepted; wait++){
+            accepted = random_stream_cycle(dut, expected, num_expected, &num_seen, stall_pct, max_stall);
+        }
+        if (!accepted){
+            std::printf("FAILED: byte %zu stalled for >%d cycles\n", i, max_wait);
+            failures++;
+            break;
         }
     }
 
+    // drain: no input left, keep clocking until every expected msg is out
+    // (at most 3 msgs are in flight: 2 in the skid + 1 in the FSM, so a few stalls' worth is plenty)
     dut->s_axis_tvalid = 0;
-    for (int i = 0; i<10 && num_seen<num_msgs; i++){
-        dut->eval();
-        if (dut->m_axis_tvalid && dut->m_axis_tready && num_seen<num_msgs){
-            const Expected &e = expected[num_seen];
-            check(get_msg_type(dut), e.msg_type, "final type");
-            check(get_order_ref(dut), e.order_ref_num, "final order_ref");
-            num_seen++;
-        }
-        tick(dut);
+    for (int i = 0; i<(max_stall+100)*4 && num_seen<num_expected; i++){
+        random_stream_cycle(dut, expected, num_expected, &num_seen, stall_pct, max_stall);
     }
+    dut->m_axis_tready = 1; // back to normal for the next test
 
-    check(num_seen, num_msgs, "messages received");
+    check(num_seen, num_expected, "messages received");
 
     if (failures != local_failures){
         std::printf("; re-run with seed %u to reproduce this result.\n", seed);
@@ -757,10 +1359,23 @@ int main(int argc, char** argv){
     test_add_order(dut);
     test_order_executed(dut);
     test_order_delete(dut);
+    test_add_mpid(dut);
+    test_executed_price(dut);
+    test_order_cancel(dut);
+    test_order_replace(dut);
+    test_skip_non_book(dut);
     test_back2back(dut);
     test_backpressure(dut);
 
+    test_field_extremes(dut);
+    test_garbage_then_resync(dut);
+    test_skip_body_all_type_codes(dut);
+    test_reset_mid_message(dut);
+
     test_random_stream(dut, 100000, 12345);
+    test_random_stream(dut, 50000, 777, 20, 30, 5); // gappy input + short stalls like the book's normal 4-5 cycles per msg
+    test_random_stream(dut, 50000, 2024, 50, 5, 80); // long stalls so the skid fills and the parser has to stop input
+    test_random_stream(dut, 5000, 99, 10, 2, 1100); // rare ~1024-cycle stalls like a rescan
 
     std::printf("\n%s (Failures: %d)\n",
                 failures ? "FAILED" : "PASSED", failures);

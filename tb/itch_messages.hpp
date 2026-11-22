@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstddef>
+#include <cstdlib>
 #include "contracts.hpp"
 
 // 2 byte fields (stock locate, tracking num)
@@ -128,7 +129,7 @@ static inline void build_common_header(
     uint64_t order_ref_num
 ){
     REQUIRES(dest != nullptr);
-    REQUIRES(type_char == 'A' || type_char == 'E' || type_char == 'D');
+    REQUIRES(type_char == 'A' || type_char == 'E' || type_char == 'C' || type_char == 'X' || type_char == 'D' || type_char == 'U');
     REQUIRES(timestamp <= 0xFFFFFFFFFFFFULL);
     //
 
@@ -178,6 +179,27 @@ static inline void build_order_add(uint8_t *dest, const OrderAdd &msg)
     ENSURES(dest[0] == 'A');
 }
 
+// ORDER ADD W/ MPID (F)
+// same bytes as A through @35, then a 4-char MPID (the firm that posted it) @36
+static constexpr size_t ORDER_ADD_MPID_LEN = 40;
+static inline void build_order_add_mpid(uint8_t *dest, const OrderAdd &msg, const char *mpid)
+{
+    REQUIRES(dest != nullptr);
+    REQUIRES(mpid != nullptr);
+    //
+
+    build_order_add(dest, msg); // bytes 0-35
+    dest[0] = 'F'; // then swap the type
+
+    std::memset(&dest[36], ' ', 4); //@36
+    size_t len = std::strlen(mpid);
+    if (len > 4) len = 4;
+    std::memcpy(&dest[36], mpid, len);
+
+    //
+    ENSURES(dest[0] == 'F');
+}
+
 // ORDER EXECUTED
 static constexpr size_t ORDER_EXECUTED_LEN = 31;
 struct OrderExecuted{
@@ -205,6 +227,65 @@ static inline void build_order_executed(uint8_t *dest, const OrderExecuted &msg)
     ENSURES(dest[0] == 'E');
 }
 
+// ORDER EXECUTED W/ PRICE (C)
+// same bytes as E through @30, then printable @31 and the execution price @32
+static constexpr size_t ORDER_EXECUTED_PRICE_LEN = 36;
+struct OrderExecutedPrice{
+    uint16_t stock_locate; //@1
+    uint16_t tracking_num; //@3
+    uint64_t timestamp; //@5
+    uint64_t order_ref_num; //@11
+    uint32_t shares; //@19
+    uint64_t match_num; //@23
+    bool printable; //@31 'Y' or 'N' (whether it shows up on the tape)
+    uint32_t exec_price; //@32
+};
+static inline void build_order_executed_price(uint8_t *dest, const OrderExecutedPrice &msg)
+{
+    REQUIRES(dest != nullptr);
+    //
+
+    // common fields
+    build_common_header(dest, 'C',
+                        msg.stock_locate, msg.tracking_num,
+                        msg.timestamp, msg.order_ref_num);
+    // rest of fields
+    write_u32_bigendian(&dest[19], msg.shares);
+    write_u64_bigendian(&dest[23], msg.match_num);
+    dest[31] = msg.printable ? 'Y' : 'N';
+    write_u32_bigendian(&dest[32], msg.exec_price);
+
+    //
+    ENSURES(dest[0] == 'C');
+}
+
+// ORDER CANCEL (X)
+// partial cancel: the order shrinks by cancelled_shares but keeps its place in line
+// carries the ref and how many shares were REMOVED, not how many are left
+static constexpr size_t ORDER_CANCEL_LEN = 23;
+struct OrderCancel{
+    uint16_t stock_locate; //@1
+    uint16_t tracking_num; //@3
+    uint64_t timestamp; //@5
+    uint64_t order_ref_num; //@11
+    uint32_t cancelled_shares; //@19
+};
+static inline void build_order_cancel(uint8_t *dest, const OrderCancel &msg)
+{
+    REQUIRES(dest != nullptr);
+    //
+
+    // common fields
+    build_common_header(dest, 'X',
+                        msg.stock_locate, msg.tracking_num,
+                        msg.timestamp, msg.order_ref_num);
+    // rest of fields
+    write_u32_bigendian(&dest[19], msg.cancelled_shares);
+
+    //
+    ENSURES(dest[0] == 'X');
+}
+
 // ORDER DELETE
 static constexpr size_t ORDER_DELETE_LEN = 19;
 struct OrderDelete{
@@ -226,6 +307,68 @@ static inline void build_order_delete(uint8_t *dest, const OrderDelete &msg)
 
     //
     ENSURES(dest[0] == 'D');
+}
+
+// ORDER REPLACE (U)
+// cancel-replace: the old order is gone and a new ref takes over (new price + shares, loses its place in line)
+// no side on the wire since a replace can't change it
+static constexpr size_t ORDER_REPLACE_LEN = 35;
+struct OrderReplace{
+    uint16_t stock_locate; //@1
+    uint16_t tracking_num; //@3
+    uint64_t timestamp; //@5
+    uint64_t orig_order_ref_num; //@11 the order being replaced
+    uint64_t new_order_ref_num; //@19 the ref it goes by from now on
+    uint32_t shares; //@27 new TOTAL shares (not a change)
+    uint32_t price; //@31 new price
+};
+static inline void build_order_replace(uint8_t *dest, const OrderReplace &msg)
+{
+    REQUIRES(dest != nullptr);
+    //
+
+    // common fields (the original ref sits @11 like every other type's ref)
+    build_common_header(dest, 'U',
+                        msg.stock_locate, msg.tracking_num,
+                        msg.timestamp, msg.orig_order_ref_num);
+    // rest of fields
+    write_u64_bigendian(&dest[19], msg.new_order_ref_num);
+    write_u32_bigendian(&dest[27], msg.shares);
+    write_u32_bigendian(&dest[31], msg.price);
+
+    //
+    ENSURES(dest[0] == 'U');
+}
+
+// TYPES THE BOOK NEVER USES
+// every non-book ITCH 5.0 type with its length (spec section 1), for testing that the parser skips them
+static constexpr size_t ITCH_MAX_MSG_LEN = 50; // longest message is NOII ('I')
+
+struct SkipType{
+    char type;
+    size_t len;
+};
+static constexpr SkipType SKIP_TYPES[] = {
+    {'S', 12}, {'R', 39}, {'H', 25}, {'Y', 20}, {'L', 26}, {'V', 35}, {'W', 12}, {'K', 28},
+    {'J', 35}, {'h', 21}, {'P', 44}, {'Q', 40}, {'B', 19}, {'I', 50}, {'N', 20}, {'O', 48}
+};
+static constexpr size_t NUM_SKIP_TYPES = sizeof(SKIP_TYPES) / sizeof(SKIP_TYPES[0]);
+
+// body is random bytes ON PURPOSE so some of them look like type codes ('A', 'D', ...)
+// the parser has to skip by length, not get fooled into thinking a new message started
+static inline void build_skip_msg(uint8_t *dest, const SkipType &t)
+{
+    REQUIRES(dest != nullptr);
+    REQUIRES(t.len > 0 && t.len <= ITCH_MAX_MSG_LEN);
+    //
+
+    dest[0] = (uint8_t)t.type;
+    for (size_t i = 1; i < t.len; i++){
+        dest[i] = (uint8_t)(rand() % 256); // any byte value
+    }
+
+    //
+    ENSURES(dest[0] == (uint8_t)t.type);
 }
 
 // MOLDUDP

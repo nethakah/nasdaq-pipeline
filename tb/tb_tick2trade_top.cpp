@@ -10,6 +10,7 @@ verilator --cc --exe --build -j 0 --assert +define+SIM --top-module tick2trade_t
 #include <cstdint>
 #include "contracts.hpp"
 #include "itch_messages.hpp"
+#include <cstdlib>
 
 static int failures = 0;
 static constexpr int DMA_PERIOD = 20;
@@ -510,6 +511,160 @@ static void test_kill_switch(){
     delete dut;
 }
 
+// appends one skip-type msg (random body) to a packet, returns bytes written
+static size_t add_skip_msg(uint8_t *dest, char type){
+    REQUIRES(dest != nullptr);
+    //
+
+    for (size_t i = 0; i < NUM_SKIP_TYPES; i++){
+        if (SKIP_TYPES[i].type == type){
+            uint8_t msg[ITCH_MAX_MSG_LEN];
+            build_skip_msg(msg, SKIP_TYPES[i]);
+            return build_mold_msg(dest, msg, (uint16_t)SKIP_TYPES[i].len);
+        }
+    }
+    ASSERT(false); // not a skip type
+    return 0;
+}
+
+// packets that look like real data: non-book msgs mixed in, another symbol, and all 7 book types
+// (A, F, E, C, X, D in the 1st packet, U in the 2nd), with an E and a U that each empty a top level
+static void test_real_mix_packet(){
+    std::printf("TEST6: packets with a real-day mix of msg types end to end\n");
+    Vtick2trade_top *dut = fresh_dut();
+    axi_write(dut, REG_STOCK_LOCATE, 1);
+    srand(4242); // skip msg bodies are random; fixed seed so a failure reproduces
+
+    OrderAdd bid;
+    bid.stock_locate = 1;
+    bid.tracking_num = 1;
+    bid.timestamp = 1000;
+    bid.order_ref_num = 100;
+    bid.is_buy = true;
+    bid.shares = 500;
+    bid.stock = "AAPL";
+    bid.price = 1230000;
+
+    OrderAdd bid2 = bid; // 2nd level down
+    bid2.order_ref_num = 300;
+    bid2.shares = 100;
+    bid2.price = 1229900;
+
+    OrderAdd ask = bid; // comes in as an F
+    ask.order_ref_num = 200;
+    ask.is_buy = false;
+    ask.shares = 300;
+    ask.price = 1230500;
+
+    OrderAdd other = bid; // different symbol, would be the best bid if it counted
+    other.stock_locate = 2;
+    other.order_ref_num = 400;
+    other.shares = 999;
+    other.price = 1240000;
+
+    OrderCancel cxl; // 500 -> 300 on the best bid
+    cxl.stock_locate = 1;
+    cxl.tracking_num = 3;
+    cxl.timestamp = 3000;
+    cxl.order_ref_num = 100;
+    cxl.cancelled_shares = 200;
+
+    OrderExecutedPrice exc_price; // 300 -> 200 on the ask, at a price that isn't the order's
+    exc_price.stock_locate = 1;
+    exc_price.tracking_num = 4;
+    exc_price.timestamp = 4000;
+    exc_price.order_ref_num = 200;
+    exc_price.shares = 100;
+    exc_price.match_num = 1;
+    exc_price.printable = true;
+    exc_price.exec_price = 1230400;
+
+    OrderExecuted exc; // fills the rest of the best bid, so the top level empties and rescans
+    exc.stock_locate = 1;
+    exc.tracking_num = 5;
+    exc.timestamp = 5000;
+    exc.order_ref_num = 100;
+    exc.shares = 300;
+    exc.match_num = 2;
+
+    OrderReplace rpl; // moves the ask (the F, 200 left after the C) to a new price and size under a new ref
+    rpl.stock_locate = 1;
+    rpl.tracking_num = 6;
+    rpl.timestamp = 6000;
+    rpl.orig_order_ref_num = 200;
+    rpl.new_order_ref_num = 500;
+    rpl.shares = 250;
+    rpl.price = 1230300;
+
+    uint8_t a_bid[ORDER_ADD_LEN];
+    uint8_t a_bid2[ORDER_ADD_LEN];
+    uint8_t f_ask[ORDER_ADD_MPID_LEN];
+    uint8_t a_other[ORDER_ADD_LEN];
+    uint8_t x_msg[ORDER_CANCEL_LEN];
+    uint8_t c_msg[ORDER_EXECUTED_PRICE_LEN];
+    uint8_t e_msg[ORDER_EXECUTED_LEN];
+    uint8_t u_msg[ORDER_REPLACE_LEN];
+    build_order_add(a_bid, bid);
+    build_order_add(a_bid2, bid2);
+    build_order_add_mpid(f_ask, ask, "GSCO");
+    build_order_add(a_other, other);
+    build_order_cancel(x_msg, cxl);
+    build_order_executed_price(c_msg, exc_price);
+    build_order_executed(e_msg, exc);
+    build_order_replace(u_msg, rpl);
+
+    // 512B is plenty: 20B header + 14 msgs, the longest being 2+50
+    uint8_t packet[512];
+    size_t n = MOLD_HEADER_LEN;
+    n += add_skip_msg(&packet[n], 'S'); // system event
+    n += add_skip_msg(&packet[n], 'R'); // stock directory
+    n += build_mold_msg(&packet[n], a_bid, ORDER_ADD_LEN);
+    n += add_skip_msg(&packet[n], 'H'); // trading action
+    n += build_mold_msg(&packet[n], f_ask, ORDER_ADD_MPID_LEN);
+    n += build_mold_msg(&packet[n], a_bid2, ORDER_ADD_LEN);
+    n += build_mold_msg(&packet[n], a_other, ORDER_ADD_LEN);
+    n += add_skip_msg(&packet[n], 'P'); // trade vs a hidden order
+    n += build_mold_msg(&packet[n], x_msg, ORDER_CANCEL_LEN);
+    n += add_skip_msg(&packet[n], 'I'); // NOII, the longest msg
+    n += build_mold_msg(&packet[n], c_msg, ORDER_EXECUTED_PRICE_LEN);
+    n += add_skip_msg(&packet[n], 'h'); // operational halt (lowercase h is its own type)
+    n += build_mold_msg(&packet[n], e_msg, ORDER_EXECUTED_LEN);
+    n += add_skip_msg(&packet[n], 'L'); // market participant position
+    build_mold_header(&packet[0], 5000, 14); // 14 msgs total, book or not
+
+    // the E triggers a ~1024 cycle rescan, so drain long enough for that
+    push_packet(dut, packet, n, CORE_PERIOD * 2000);
+
+    check(dut->best_bid_price, 1229900, "2nd level promoted after the top emptied");
+    check(dut->best_bid_shares, 100, "its shares");
+    check(dut->best_ask_price, 1230500, "F landed as the ask");
+    check(dut->best_ask_shares, 200, "300 - 100 from the C");
+    check(dut->miss_count, 0, "every E/C/X found its order");
+    check(dut->overflow_count, 0, "no overflow");
+    check(dut->packet_count, 1, "1 packet");
+    check(dut->gap_count, 0, "no gaps");
+
+    // 2nd packet picks up right where the 1st left off (seq 5000 + 14 msgs = 5014)
+    uint8_t packet2[128]; // 20B header + (2+35)B U + (2+44)B P = 103B
+    size_t n2 = MOLD_HEADER_LEN;
+    n2 += build_mold_msg(&packet2[n2], u_msg, ORDER_REPLACE_LEN);
+    n2 += add_skip_msg(&packet2[n2], 'P'); // trade vs a hidden order
+    build_mold_header(&packet2[0], 5014, 2);
+
+    // the U's delete half empties the top ask level (rescan), so same long drain
+    push_packet(dut, packet2, n2, CORE_PERIOD * 2000);
+
+    check(dut->best_ask_price, 1230300, "U moved the ask to its new price");
+    check(dut->best_ask_shares, 250, "U's new total");
+    check(dut->best_bid_price, 1229900, "bid side untouched by the U");
+    check(dut->miss_count, 0, "U found its order");
+    check(dut->packet_count, 2, "2 packets");
+    check(dut->gap_count, 0, "no gap between the 2 packets");
+
+    dut->final();
+    delete dut;
+}
+
 int main(int argc, char **argv){
     Verilated::commandArgs(argc, argv);
 
@@ -518,6 +673,7 @@ int main(int argc, char **argv){
     test_end2end_fire();
     test_gap_detection();
     test_kill_switch();
+    test_real_mix_packet();
 
     std::printf("\n%s (Failures: %d)\n",
                 failures ? "FAILED" : "PASSED", failures);
