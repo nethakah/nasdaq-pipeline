@@ -86,8 +86,9 @@ static size_t build_random_stream(FILE *f, int num_msgs, unsigned int seed){
                 a.is_buy = (rand() % 2) == 0;
                 a.shares = 1 + (rand() % 1000);
                 a.stock = "AAPL";
-                if (a.is_buy) a.price = PRICE_BASE - 1 - (rand() % PRICE_SPAN);
-                else          a.price = PRICE_BASE + (rand() % PRICE_SPAN);
+                // whole pennies, like every real price from $1 up
+                if (a.is_buy) a.price = PRICE_BASE - 100*(1 + rand() % PRICE_SPAN);
+                else          a.price = PRICE_BASE + 100*(rand() % PRICE_SPAN);
 
                 uint8_t buf[ORDER_ADD_LEN];
                 build_order_add(buf, a);

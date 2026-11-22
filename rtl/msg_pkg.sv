@@ -146,12 +146,38 @@ package msg_pkg;
     localparam int LEVEL_ADDR_WIDTH = 10;
     localparam int NUM_LEVELS = 1 << LEVEL_ADDR_WIDTH;
 
-    function automatic logic[LEVEL_ADDR_WIDTH-1:0] hash_price(
+    // ladder slot for a price: indexed by tick, not hashed
+    // from $1 up every price is a whole penny (Reg NMS bans sub-penny quotes there), so a multiple of 100 = 4*25:
+    // the low 2 bits are always 0 so they get dropped, and since 25 is odd, any 1024 pennies in a row land in 1024 different slots
+    // under $1 the tick is $0.0001, so the price itself is the index
+    // 2 live prices only share a slot if they're exactly 1024 ticks apart ($10.24 from $1 up)
+    // (the old XOR-fold hash only ever hit 256 slots for penny prices and collided on 6,400 of 8,892 symbols in a real day)
+    localparam logic[31:0] ONE_DOLLAR = 32'd10000; // 4 implied decimals
+    localparam logic[31:0] PENNY = 32'd100; // the tick from $1 up
+    localparam logic[31:0] SUB_PENNY = 32'd1; // the tick under $1 ($0.0001)
+
+    function automatic logic[LEVEL_ADDR_WIDTH-1:0] price_slot(
         input logic[31:0] price
     );
-        logic[15:0] folded;
-        folded = price[15:0] ^ price[31:16];
-        hash_price = folded[LEVEL_ADDR_WIDTH-1:0];
+        if (price >= ONE_DOLLAR) begin
+            price_slot = price[LEVEL_ADDR_WIDTH+1:2];
+        end
+        else begin
+            price_slot = price[LEVEL_ADDR_WIDTH-1:0];
+        end
+    endfunction
+
+    // the next price a level could be at, 1 tick further from the top (bids walk down, asks walk up)
+    function automatic logic[31:0] tick_away(
+        input logic[31:0] price,
+        input logic is_buy
+    );
+        if (is_buy) begin
+            tick_away = (price > ONE_DOLLAR) ? price - PENNY : price - SUB_PENNY;
+        end
+        else begin
+            tick_away = (price >= ONE_DOLLAR) ? price + PENNY : price + SUB_PENNY;
+        end
     endfunction
 
     // flat widths for mem declarations because Vivado RAM interface needs plain `logic[W-1:0] mem[DEPTH]` look

@@ -30,7 +30,7 @@ Overview of the datapath:
 ```
 The on-chip order book here is 3 levels of LUTRAM (see /build_logs/ to see how I came to this):
 - L3 hashes `order_ref_num` into 1024 buckets 4 wide, compared in parallel to make lookup a fixed cycle count.
-- L2 is a price ladder per side (buy/sell).
+- L2 is a price ladder per side (buy/sell), indexed by tick so any 1024 ticks in a row get their own slots. When the best level empties, it walks tick by tick to the next one (usually a few cycles) instead of scanning all 1024 slots.
 - L1 is best bid and ask.
 - Buckets are 640 bits.
 
@@ -50,6 +50,8 @@ All 23 message types have their lengths in the parser, since even a message that
 | The other 14 | Skipped by length |
 
 Checked against a real day (`12302019.NASDAQ_ITCH50.gz`, 268.7M messages): the C++ reference model finds every order across all 263M book messages (0 misses).
+
+Of the 8,892 symbols that traded that day, the RTL as it is holds 4,392 for the whole day without dropping an order or losing a price level. The rest are capacity: books with live levels more than $10.24 apart (4,095) or 5 orders landing in 1 bucket (405), which is what the multi-symbol tiering is for.
 
 ## Fail closed
 The trade signal only fires when everything says it's safe, and anything uncertain counts as a no:
@@ -91,6 +93,7 @@ build_logs/
 
 ## Testing
 - One Verilator testbench per module, plus `tb_top.cpp` end to end (raw MoldUDP64 packets in, fired order out).
+- A real Nasdaq day replayed through the whole RTL one symbol at a time (`tb/replay/replay_rtl.cpp`), checked against the model after every message. VALX, the busiest symbol that fits, matches on all 241,700 of its messages. This is also what found the rescan never looking at the ladder's last slot.
 - Randomized streams checked message by message against `book_model.hpp`, which is a different structure on purpose (sorted maps, no hashing, no capacity limit) so the model and the RTL can't share a bug.
 - Backpressure comes in bursts up to ~1,100 cycles (like a real rescan), because 1-cycle stalls never fill the skid buffer.
 - Edge cases: every field at max and at 0, garbage bytes, reset mid-message, refs 0 and 2^64-1, the lowest and highest legal prices, full buckets, and every U corner case.
@@ -108,10 +111,13 @@ build_logs/
 ```
     rm -rf obj_dir && verilator --cc --exe --build -j 0 --assert +define+SIM --top-module top rtl/msg_pkg.sv rtl/skid_buffer.sv rtl/async_fifo.sv rtl/moldudp_deframer.sv rtl/itch_parser.sv rtl/order_book.sv rtl/trade_signal.sv rtl/top_csr.sv rtl/top.sv tb/tb_top.cpp && ./obj_dir/Vtop
 ```
-3. Reference model over a real day (day files are on Nasdaq's public ITCH directory, ~3.5 GB compressed):
+3. Reference model over a real day (day files are on Nasdaq's public ITCH directory, ~3.5 GB compressed), then 1 symbol of it through the RTL:
 ```
     g++ -std=c++17 -O2 -o tb/replay/replay_book tb/replay/replay_book.cpp tb/replay/itch_file_reader.cpp -lz
     ./tb/replay/replay_book <day>.NASDAQ_ITCH50.gz
+
+    rm -rf obj_dir && verilator --cc --exe --build -j 0 --assert +define+SIM --public-flat-rw --top-module top rtl/msg_pkg.sv rtl/skid_buffer.sv rtl/async_fifo.sv rtl/moldudp_deframer.sv rtl/itch_parser.sv rtl/order_book.sv rtl/trade_signal.sv rtl/top_csr.sv rtl/top.sv tb/replay/replay_rtl.cpp tb/replay/itch_file_reader.cpp -LDFLAGS -lz -o replay_rtl
+    ./obj_dir/replay_rtl <day>.NASDAQ_ITCH50.gz <TICKER>
 ```
 4. Out-of-context synth and impl:
 ```
@@ -143,7 +149,7 @@ build_logs/
 - [x] Golden reference model and randomized regression
 - [x] Reference model over a full real Nasdaq day
 - [x] Running on ZCU104 over AXI-DMA
-- [ ] Replay a real Nasdaq day through the RTL in Verilator
+- [x] Replay a real Nasdaq day through the RTL in Verilator
 - [ ] L3 into URAM and a bigger ladder (a real day peaks at 37,068 orders and 4,227 levels a side in one symbol)
 - [ ] Multi-symbol (top of book on chip, the rest in DRAM)
 - [ ] ASIC flow with Genus/Innovus to find PPA in SRAM instead of LUTRAM

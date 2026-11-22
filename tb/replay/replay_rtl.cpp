@@ -304,13 +304,14 @@ int main(int argc, char **argv){
             packets++;
             pending.clear();
 
+            // capacity first: an assertion in the same packet as the RTL running out of room is that, not a bug
+            note_capacity(first_overflow, dut->overflow_count, sent, last_timestamp);
+            note_capacity(first_collision, dut->level_collision_count, sent, last_timestamp);
+
             if (Verilated::gotError()){
                 assertion = true;
                 return false;
             }
-
-            note_capacity(first_overflow, dut->overflow_count, sent, last_timestamp);
-            note_capacity(first_collision, dut->level_collision_count, sent, last_timestamp);
 
             bool trading = (h_state == 'T') && !nasdaq_op_halted;
             if (dut->best_bid_price == model.best_bid_price()

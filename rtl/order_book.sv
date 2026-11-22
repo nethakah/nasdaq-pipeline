@@ -50,13 +50,15 @@ module order_book
         FIND_ORDER = 3'd2, // if A, reads level here nad updates
         READ_LEVEL = 3'd3, // for E/D - read the level after learning the price
         UPDATE = 3'd4, // modify both L3 and L2
-        RESCAN = 3'd5 // for when top level fully empties
+        RESCAN = 3'd5, // for when top level fully empties
+        WALK = 3'd6 // top level emptied: check the next ticks out for the new top before falling back to RESCAN
     } book_state_enum;
     book_state_enum state;
     // ADD (4): IDLE -> READ_BUCKET -> FIND_ORDER -> UPDATE
     // E/D (5): IDLE -> READ_BUCKET -> FIND_ORDER -> READ_LEVEL -> UPDATE
     // U (8): the E/D path on the old ref, then READ_BUCKET -> FIND_ORDER -> UPDATE again as an ADD on the new ref
     //        (+ RESCAN between the 2 halves if the old order was the last one at the top level)
+    // top level emptied: UPDATE -> WALK (1 cycle per tick to the next level) -> RESCAN only if nothing within 1024 ticks
 
     logic[BUCKET_BITS-1:0] book_mem[NUM_BUCKETS]; // L3 table - 1 read for whole bucket
     logic[LEVEL_BITS-1:0] bid_levels[NUM_LEVELS]; // L2 bids
@@ -104,6 +106,31 @@ module order_book
         else rescan_level = level_t'(ask_levels[rescan_index]);
     end
 
+    // live levels per side, so a side that just lost its last level goes empty right away instead of being searched
+    logic[LEVEL_ADDR_WIDTH:0] bid_level_count; // 0 to NUM_LEVELS, so 1 more bit than a slot index
+    logic[LEVEL_ADDR_WIDTH:0] ask_level_count;
+
+    // WALK: the ladder is indexed by tick, so the next best level after the top empties is the next tick out that has one
+    // (usually a tick or 2 away). the 1st slot holding exactly the price being checked is the new top, since every
+    // price between it and the old top was just checked and isn't there.
+    // no hit in 1024 ticks: if they were all on 1 side of $1 that was every slot once, so the best valid slot seen is the
+    // new top (same answer as a RESCAN). only a walk that crossed $1 (2 tick sizes can share slots) needs the full RESCAN
+    logic[31:0] walk_price; // price being checked this cycle
+    logic[LEVEL_ADDR_WIDTH-1:0] walk_slot; // its slot, registered alongside it so the slot math isn't in front of the read
+    logic[LEVEL_ADDR_WIDTH-1:0] walk_count; // ticks checked so far
+    logic walk_crossed_dollar; // the walk went from penny ticks to sub-penny ticks or back
+    level_t walk_level;
+    always_comb begin
+        if (rescan_is_buy) walk_level = level_t'(bid_levels[walk_slot]);
+        else walk_level = level_t'(ask_levels[walk_slot]);
+    end
+    logic walk_found;
+    assign walk_found = walk_level.valid && (walk_level.price == walk_price);
+
+    // WALK and RESCAN both track the best valid level they've looked at
+    level_t scan_level;
+    assign scan_level = (state == WALK) ? walk_level : rescan_level;
+
     // best level so far INCLUDING this cycle's slot
     // (the last slot gets compared in the same cycle the result is written to the top of book)
     logic rescan_take; // this slot beats the best so far
@@ -111,13 +138,13 @@ module order_book
     logic[31:0] rescan_next_shares;
     always_comb begin
         if (rescan_is_buy) begin // higher bid replaces
-            rescan_take = rescan_level.valid && (rescan_level.price > rescan_best_price);
+            rescan_take = scan_level.valid && (scan_level.price > rescan_best_price);
         end
         else begin // lower ask replaces
-            rescan_take = rescan_level.valid && (rescan_level.price < rescan_best_price);
+            rescan_take = scan_level.valid && (scan_level.price < rescan_best_price);
         end
-        rescan_next_price = rescan_take ? rescan_level.price : rescan_best_price;
-        rescan_next_shares = rescan_take ? rescan_level.total_shares : rescan_best_shares;
+        rescan_next_price = rescan_take ? scan_level.price : rescan_best_price;
+        rescan_next_shares = rescan_take ? scan_level.total_shares : rescan_best_shares;
     end
 
     // THE PARALLEL COMPARES
@@ -211,6 +238,8 @@ module order_book
             level_collision_count <= '0;
             book_valid <= '0;
             rpl_pending <= '0;
+            bid_level_count <= '0;
+            ask_level_count <= '0;
 
             trading_state <= '0; // no H seen yet = not allowed to trade
             nasdaq_op_halted <= '0;
@@ -268,16 +297,16 @@ module order_book
                         // Add has its price embedded so level address is known already
                         curr_price <= curr_msg.price;
                         curr_is_buy <= curr_msg.is_buy;
-                        curr_level <= hash_price(curr_msg.price);
+                        curr_level <= price_slot(curr_msg.price);
                         level_data <= curr_msg.is_buy ?
-                                      level_t'(bid_levels[hash_price(curr_msg.price)]) : level_t'(ask_levels[hash_price(curr_msg.price)]);
+                                      level_t'(bid_levels[price_slot(curr_msg.price)]) : level_t'(ask_levels[price_slot(curr_msg.price)]);
                         state <= UPDATE;
                     end
                     else if (match_found) begin
                         // level read costs +1 cycle since E/D dont carry price
                         curr_price <= bucket_data[match_index].price;
                         curr_is_buy <= bucket_data[match_index].is_buy;
-                        curr_level <= hash_price(bucket_data[match_index].price);
+                        curr_level <= price_slot(bucket_data[match_index].price);
 
                         // if its DEL, a replace (the whole old order goes), or fully filled execute, then remove whole order
                         // (U's shares are the NEW order's total, so they can't be compared against the old order here)
@@ -331,9 +360,11 @@ module order_book
                                     // empty slot so create the level
                                     if (curr_is_buy) begin
                                         bid_levels[curr_level] <= level_next;
+                                        bid_level_count <= bid_level_count + 1'b1;
                                     end
                                     else begin
                                         ask_levels[curr_level] <= level_next;
+                                        ask_level_count <= ask_level_count + 1'b1;
                                     end
                                     book_valid <= 1'b1;
                                 end
@@ -392,20 +423,46 @@ module order_book
                                         ask_levels[curr_level] <= level_next;
                                     end
                                 if (level_data.order_count==16'd1 && order_left) begin
+                                    if (curr_is_buy) begin
+                                        bid_level_count <= bid_level_count - 1'b1;
+                                    end
+                                    else begin
+                                        ask_level_count <= ask_level_count - 1'b1;
+                                    end
+
                                     // RESCAN CASE - if the level we're removing was top of book
                                     if (curr_is_buy && curr_price==top_bid_price) begin
                                         rescan_is_buy <= 1'b1;
-                                        rescan_index <= '0;
-                                        rescan_best_shares <= '0;
-                                        rescan_best_price <= '0;
-                                        state <= RESCAN;
+                                        if (bid_level_count == 1) begin
+                                            // that was the last bid level, nothing to look for
+                                            top_bid_price <= '0;
+                                            top_bid_shares <= '0;
+                                        end
+                                        else begin
+                                            walk_price <= tick_away(curr_price, 1'b1);
+                                            walk_slot <= price_slot(tick_away(curr_price, 1'b1));
+                                            walk_count <= '0;
+                                            walk_crossed_dollar <= '0;
+                                            rescan_best_price <= '0;
+                                            rescan_best_shares <= '0;
+                                            state <= WALK;
+                                        end
                                     end
                                     else if (!curr_is_buy && curr_price==top_ask_price) begin
                                         rescan_is_buy <= '0;
-                                        rescan_index <= '0;
-                                        rescan_best_shares <= '0;
-                                        rescan_best_price <= 32'hFFFFFFFF;
-                                        state <= RESCAN;
+                                        if (ask_level_count == 1) begin
+                                            top_ask_price <= 32'hFFFFFFFF;
+                                            top_ask_shares <= '0;
+                                        end
+                                        else begin
+                                            walk_price <= tick_away(curr_price, 1'b0);
+                                            walk_slot <= price_slot(tick_away(curr_price, 1'b0));
+                                            walk_count <= '0;
+                                            walk_crossed_dollar <= '0;
+                                            rescan_best_price <= 32'hFFFFFFFF;
+                                            rescan_best_shares <= '0;
+                                            state <= WALK;
+                                        end
                                     end
                                 end
                                 else begin
@@ -447,6 +504,56 @@ module order_book
                         // don't publish the half-done book (old order out, new one not in yet)
                         // trade_signal acts on book_valid, so it could fire on a top of book that never existed on the exchange
                         book_valid <= '0;
+                    end
+                end
+
+                WALK: begin
+                    rescan_best_price <= rescan_next_price;
+                    rescan_best_shares <= rescan_next_shares;
+
+                    if (walk_found) begin
+                        if (rescan_is_buy) begin
+                            top_bid_price <= walk_level.price;
+                            top_bid_shares <= walk_level.total_shares;
+                        end
+                        else begin
+                            top_ask_price <= walk_level.price;
+                            top_ask_shares <= walk_level.total_shares;
+                        end
+
+                        // a U still has its add half to do (and it publishes once that lands)
+                        state <= rpl_pending ? READ_BUCKET : IDLE;
+                        book_valid <= !rpl_pending;
+                    end
+                    else if (walk_count == LEVEL_ADDR_WIDTH'(NUM_LEVELS-1)) begin
+                        if (!walk_crossed_dollar) begin
+                            // every slot got looked at once, so the best one seen is the new top
+                            if (rescan_is_buy) begin
+                                top_bid_price <= rescan_next_price;
+                                top_bid_shares <= rescan_next_shares;
+                            end
+                            else begin
+                                top_ask_price <= rescan_next_price;
+                                top_ask_shares <= rescan_next_shares;
+                            end
+                            state <= rpl_pending ? READ_BUCKET : IDLE;
+                            book_valid <= !rpl_pending;
+                        end
+                        else begin
+                            // some slots got looked at twice and some never, so scan them all
+                            rescan_index <= '0;
+                            rescan_best_shares <= '0;
+                            rescan_best_price <= rescan_is_buy ? 32'd0 : 32'hFFFFFFFF;
+                            state <= RESCAN;
+                        end
+                    end
+                    else begin
+                        walk_price <= tick_away(walk_price, rescan_is_buy);
+                        walk_slot <= price_slot(tick_away(walk_price, rescan_is_buy));
+                        walk_count <= walk_count + 1'b1;
+                        if ((tick_away(walk_price, rescan_is_buy) >= ONE_DOLLAR) != (walk_price >= ONE_DOLLAR)) begin
+                            walk_crossed_dollar <= 1'b1;
+                        end
                     end
                 end
 
@@ -509,6 +616,10 @@ module order_book
             $rose(symbol_trading) |-> $past(s_axis_tvalid && s_axis_tready && (s_axis_tdata.stock_locate == cfg_stock_locate)
                                             && (s_axis_tdata.msg_type == MSG_ACT || s_axis_tdata.msg_type == MSG_OPH))
         ) else $error("trading got unblocked by something other than an H/h for our symbol");
+        assert property(
+            @(posedge clk) disable iff (!rst_n)
+            (bid_level_count <= (LEVEL_ADDR_WIDTH+1)'(NUM_LEVELS)) && (ask_level_count <= (LEVEL_ADDR_WIDTH+1)'(NUM_LEVELS))
+        ) else $error("level count went past the ladder size (it wrapped below 0)");
         assert property(
             @(posedge clk) disable iff (!rst_n)
             miss_count >= $past(miss_count)

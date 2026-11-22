@@ -120,6 +120,9 @@ static void setup_msg(
     }
 }
 
+// cycles the book spent on the last msg (handshake to back in IDLE), for the tests that care how fast a rescan is
+static int last_msg_cycles = 0;
+
 // hands whatever setup_msg put on s_axis_tdata to the book, then waits for it to get back to IDLE
 // returns how many times the book published (book_valid pulses) while working on that msg
 static int send_and_wait(Vorder_book *dut, uint64_t order_ref, int max_wait){
@@ -149,6 +152,7 @@ static int send_and_wait(Vorder_book *dut, uint64_t order_ref, int max_wait){
     for (int i = 0; i < max_wait; i++){
         dut->eval();
         if (dut->s_axis_tready){
+            last_msg_cycles = i + 1; // + the handshake cycle
             return pulses;
         }
         tick(dut);
@@ -498,7 +502,7 @@ static void test_bucket_slot_reuse(){
     // same refs as TEST13, all hash to bucket 7 (1024 apart, so the low 10 bits match)
     uint64_t refs[5] = {7, 1031, 2055, 3079, 4103};
     for (int i = 0; i < 4; i++){
-        push_msg(dut, MSG_ADD, true, 1, refs[i], 100, 1230000 - i);
+        push_msg(dut, MSG_ADD, true, 1, refs[i], 100, 1230000 - 100*i);
     }
     push_msg(dut, MSG_ADD, true, 1, refs[4], 987, 1231000);
     check(dut->overflow_count, 1, "5th overflows a full bucket");
@@ -695,8 +699,8 @@ static void test_rpl_buckets(){
     uint64_t bucket7[4] = {7, 1031, 2055, 3079};
     uint64_t bucket8[4] = {8, 1032, 2056, 3080};
     for (int i = 0; i < 4; i++){
-        push_msg(dut, MSG_ADD, true, 1, bucket7[i], 100, 1230000 - i);
-        push_msg(dut, MSG_ADD, true, 1, bucket8[i], 100, 1220000 - i);
+        push_msg(dut, MSG_ADD, true, 1, bucket7[i], 100, 1230000 - 100*i);
+        push_msg(dut, MSG_ADD, true, 1, bucket8[i], 100, 1220000 - 100*i);
     }
 
     // 4103 is bucket 7 too: the delete half frees 1031's slot right before the add half needs one
@@ -812,24 +816,115 @@ static void test_symbol_switch_blocks(){
     delete dut;
 }
 
-// the ladder's last slot (1023) has to be in the rescan too
-// 1007600 and 1220589 both hash to slot 1023 (16b halves XORed, low 10 bits)
+// a next level more than 1024 ticks away, sitting in the ladder's last slot (1023), still gets found:
+// - asks: 1122300 is 1198 ticks up, so the walk sees every slot once without an exact hit and takes the best it saw
+// - bids: the walk from $3.40 crosses $1 and never reaches slot 1023 (240 penny ticks, then 784 sub-penny ones),
+//   so only the full rescan can find 8191 there ($0.8191, and under $1 the slot is the price's low 10 bits)
 static void test_rescan_finds_last_slot(){
-    std::printf("TEST33: a rescan finds a level sitting in the ladder's last slot\n");
+    std::printf("TEST33: a level far from the top, in the ladder's last slot, gets found (walk and full rescan)\n");
     Vorder_book *dut = fresh_dut();
 
-    push_msg(dut, MSG_ADD, false, 1, 100, 829, 1002500); // best ask, slot 11
-    push_msg(dut, MSG_ADD, false, 1, 101, 342, 1007600); // next ask, slot 1023
-    push_msg(dut, MSG_DEL, false, 1, 100, 0, 0); // top empties, rescan
-    check(dut->best_ask_price, 1007600, "ask in slot 1023 promoted");
+    push_msg(dut, MSG_ADD, false, 1, 100, 829, 1002500); // best ask
+    push_msg(dut, MSG_ADD, false, 1, 101, 342, 1122300); // next ask, slot 1023, 1198 ticks up
+    push_msg(dut, MSG_DEL, false, 1, 100, 0, 0);
+    check(dut->best_ask_price, 1122300, "ask in slot 1023 promoted");
     check(dut->best_ask_shares, 342, "its shares");
     push_msg(dut, MSG_DEL, false, 1, 101, 0, 0); // clear the asks so the bids below can't cross them
 
-    push_msg(dut, MSG_ADD, true, 1, 200, 500, 1225000); // best bid
-    push_msg(dut, MSG_ADD, true, 1, 201, 77, 1220589); // next bid, slot 1023
-    push_msg(dut, MSG_DEL, false, 1, 200, 0, 0);
-    check(dut->best_bid_price, 1220589, "bid in slot 1023 promoted");
+    push_msg(dut, MSG_ADD, true, 1, 200, 500, 34000); // best bid, $3.40
+    push_msg(dut, MSG_ADD, true, 1, 201, 77, 8191); // next bid, slot 1023, way under $1
+    push_msg(dut, MSG_DEL, false, 1, 200, 0, 0, 3000); // walk (1024) + full rescan (1024)
+    check(dut->best_bid_price, 8191, "bid in slot 1023 promoted");
     check(dut->best_bid_shares, 77, "its shares");
+
+    dut->final();
+    delete dut;
+}
+
+// tick-indexed ladder: penny prices use all 1024 slots, so only prices exactly $10.24 apart share one
+// (the old hash put $2.56 apart in the same slot, which is what most real symbols tripped on)
+static void test_ladder_tick_index(){
+    std::printf("TEST34: ladder slots go by tick ($2.56 apart is fine, sub-dollar ticks are fine, $10.24 apart collides)\n");
+    Vorder_book *dut = fresh_dut();
+
+    push_msg(dut, MSG_ADD, true, 1, 100, 500, 1230000); // $123.00
+    push_msg(dut, MSG_ADD, true, 1, 101, 200, 1204400); // $120.44, same slot as $123.00 under the old hash
+    check(dut->level_collision_count, 0, "$2.56 apart gets 2 slots");
+    push_msg(dut, MSG_DEL, false, 1, 100, 0, 0);
+    check(dut->best_bid_price, 1204400, "the lower level was really tracked");
+    check(dut->best_bid_shares, 200, "its shares");
+
+    push_msg(dut, MSG_DEL, false, 1, 101, 0, 0); // clear the bids so the sub-dollar asks below can't cross them
+
+    // under $1 every $0.0001 is a tick, so neighbors can't share
+    push_msg(dut, MSG_ADD, false, 1, 200, 10, 5000);
+    push_msg(dut, MSG_ADD, false, 1, 201, 20, 5001);
+    push_msg(dut, MSG_ADD, false, 1, 202, 30, 5002);
+    check(dut->level_collision_count, 0, "sub-dollar ticks get their own slots");
+    push_msg(dut, MSG_DEL, false, 1, 200, 0, 0);
+    check(dut->best_ask_price, 5001, "next sub-dollar tick promoted");
+    push_msg(dut, MSG_DEL, false, 1, 201, 0, 0);
+    push_msg(dut, MSG_DEL, false, 1, 202, 0, 0);
+
+    // the known limit: exactly 1024 pennies apart is the same slot
+    push_msg(dut, MSG_ADD, true, 1, 400, 100, 1230000);
+    push_msg(dut, MSG_ADD, true, 1, 401, 100, 1127600); // $10.24 below
+    check(dut->level_collision_count, 1, "$10.24 apart collides");
+
+    dut->final();
+    delete dut;
+}
+
+// the usual case: the next level is a tick or a few away, so the walk finds it in a few cycles (a full rescan is ~1030)
+static void test_walk_to_next_level(){
+    std::printf("TEST35: an emptied top finds the next level by walking ticks, including across $1\n");
+    Vorder_book *dut = fresh_dut();
+
+    push_msg(dut, MSG_ADD, true, 1, 100, 500, 1230000);
+    push_msg(dut, MSG_ADD, true, 1, 101, 200, 1229700); // 3 ticks down
+    push_msg(dut, MSG_DEL, false, 1, 100, 0, 0);
+    check(dut->best_bid_price, 1229700, "next bid found");
+    check(dut->best_bid_shares, 200, "its shares");
+    check(last_msg_cycles < 20, 1, "in a few cycles, not a full rescan");
+    push_msg(dut, MSG_DEL, false, 1, 101, 0, 0);
+
+    // across $1 the tick changes from $0.01 to $0.0001
+    push_msg(dut, MSG_ADD, true, 1, 200, 10, 10000); // $1.00
+    push_msg(dut, MSG_ADD, true, 1, 201, 20, 9998); // $0.9998
+    push_msg(dut, MSG_DEL, false, 1, 200, 0, 0);
+    check(dut->best_bid_price, 9998, "bid walked from $1.00 down into sub-dollar ticks");
+    check(last_msg_cycles < 20, 1, "still a few cycles");
+    push_msg(dut, MSG_DEL, false, 1, 201, 0, 0);
+
+    push_msg(dut, MSG_ADD, false, 1, 300, 10, 9999); // $0.9999
+    push_msg(dut, MSG_ADD, false, 1, 301, 20, 10100); // $1.01
+    push_msg(dut, MSG_DEL, false, 1, 300, 0, 0);
+    check(dut->best_ask_price, 10100, "ask walked from sub-dollar up into pennies");
+    check(last_msg_cycles < 20, 1, "still a few cycles");
+    check(dut->level_collision_count, 0, "no collisions");
+
+    dut->final();
+    delete dut;
+}
+
+// when the last level on a side goes, there's nothing to search for
+static void test_last_level_empties_side(){
+    std::printf("TEST36: the last level on a side leaving sets that side empty right away\n");
+    Vorder_book *dut = fresh_dut();
+
+    push_msg(dut, MSG_ADD, true, 1, 100, 500, 1230000);
+    push_msg(dut, MSG_ADD, false, 1, 101, 300, 1230500);
+    push_msg(dut, MSG_DEL, false, 1, 100, 0, 0);
+    check(dut->best_bid_price, BID_EMPTY, "bid side empty");
+    check(dut->best_bid_shares, 0, "no shares");
+    check(last_msg_cycles < 20, 1, "no walk or rescan");
+    check(dut->best_ask_price, 1230500, "ask side untouched");
+
+    // U of the only ask: the side is briefly empty, then the add half refills it
+    int pulses = push_replace(dut, 1, 101, 102, 400, 1230600, true);
+    check(dut->best_ask_price, 1230600, "ask at the new price");
+    check(dut->best_ask_shares, 400, "new size");
+    check(pulses, 1, "published once");
 
     dut->final();
     delete dut;
@@ -868,11 +963,12 @@ static constexpr uint32_t PRICE_BASE = 1230000;
 static constexpr uint32_t PRICE_SPAN = 20;
 
 // bids below PRICE_BASE, asks at or above it, so the random book never crosses
+// whole pennies like every real price from $1 up (PRICE_SPAN levels a side)
 static uint32_t random_price(bool is_buy){
     if (is_buy){
-        return PRICE_BASE - 1 - (rand() % PRICE_SPAN);
+        return PRICE_BASE - 100*(1 + rand() % PRICE_SPAN);
     }
-    return PRICE_BASE + (rand() % PRICE_SPAN);
+    return PRICE_BASE + 100*(rand() % PRICE_SPAN);
 }
 
 static void forget_ref(uint64_t ref){
@@ -989,8 +1085,8 @@ static void test_random_against_model(int num_msgs, unsigned int seed){
             else{
                 // new price would be the best bid possible, so if the RTL wrongly adds it the top shows it
                 uint64_t new_ref = next_ref++;
-                push_replace(dut, 1, ref, new_ref, 100, PRICE_BASE - 1, true);
-                model.replace_order(ref, new_ref, PRICE_BASE - 1, 100);
+                push_replace(dut, 1, ref, new_ref, 100, PRICE_BASE - 100, true);
+                model.replace_order(ref, new_ref, PRICE_BASE - 100, 100);
             }
         }
 
@@ -1033,7 +1129,7 @@ static void test_bucket_overflow(){
 
     uint64_t refs[5] = {7, 1031, 2055, 3079, 4103};
     for (int i = 0; i < 4; i++){
-        push_msg(dut, MSG_ADD, true, 1, refs[i], 100, 1230000 - i);
+        push_msg(dut, MSG_ADD, true, 1, refs[i], 100, 1230000 - 100*i);
     }
 
     check(dut->overflow_count, 0, "4/4 fit");
@@ -1044,7 +1140,7 @@ static void test_bucket_overflow(){
     check(dut->best_bid_price, 1230000, "dropped order doesn't reach book");
     push_msg(dut, MSG_DEL, false, 1, refs[0], 0, 0);
     check(dut->miss_count, 0, "first order findable after overflow");
-    check(dut->best_bid_price, 1229999, "2nd best got promoted");
+    check(dut->best_bid_price, 1229900, "2nd best got promoted");
 
     dut->final();
     delete dut;
@@ -1088,6 +1184,9 @@ int main(int argc, char **argv){
     test_halts_other_symbols_ignored();
     test_symbol_switch_blocks();
     test_rescan_finds_last_slot();
+    test_ladder_tick_index();
+    test_walk_to_next_level();
+    test_last_level_empties_side();
 
     std::printf("\n%s (Failures: %d)\n",
                 failures ? "FAILED" : "PASSED", failures);

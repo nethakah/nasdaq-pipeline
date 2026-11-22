@@ -398,3 +398,12 @@ source fpga/scripts/create_bd.tcl
 ### log-69: Gaps trip the kill switch (2026-11-21)
 - A MoldUDP64 gap means lost packets that could've had anything for my symbol, and with no retransmit or snapshot (Nasdaq's GLIMPSE) yet, the book can't be trusted after that. So a gap clears `cfg_armed` and software has to look and re-arm.
 - If a gap and a re-arm land on the same cycle, the gap wins.
+
+### log-70: A real day through the RTL (2026-11-21)
+- `replay_rtl` sends 1 symbol's messages from the real day through the whole `top` (packets in, book out) and checks the top of book, misses and trading state against the model after every message. `replay_book` also copies the RTL's hashing now, to see which symbols the RTL could hold all day.
+- First thing it found (on a test file with a wide price range) was that RESCAN never looked at the ladder's last slot. The final compare and the write to the top of book land on the same cycle, so the write used the best from before slot 1023. The random tests never put a price in slot 1023 since they only used ~20 slots.
+- Real day: only 2,415 of 8,892 symbols fit all day, and 6,400 of the rest died on ladder collisions, not L3. The price hash only ever hit 256 of the 1024 slots, because every price from $1 up is a whole penny (Reg NMS bans sub-penny quotes there) and 100 = 4*25, so the low 2 bits are always 0. That made 2 levels $2.56 apart always collide.
+- So the ladder is indexed by tick now: `price >> 2` from $1 up (25 is odd, so any 1024 pennies in a row get 1024 different slots) and the price itself under $1. Now only levels exactly $10.24 apart share a slot, and 4,392 symbols fit all day. What's left is capacity: 4,095 have levels more than $10.24 apart and 405 get a 5th order in 1 bucket. Tiering fixes both since only the top levels need to be on chip.
+- Since the ladder goes in tick order, the next level after the top empties is just the next tick out that has one, so RESCAN became a walk (usually a few cycles instead of ~1,030). It falls back to the full scan only if nothing turns up within 1024 ticks and the walk crossed $1, and a side that loses its last level goes empty right away.
+- VALX (the busiest symbol that fits, 241,700 messages) matched the model after every message for the whole day.
+- AAPL hits a ladder collision 762 messages in. On a collision the RTL still moves the top of book but doesn't publish it, so how the book fails closed when it runs out of room gets decided with the multi-symbol design.

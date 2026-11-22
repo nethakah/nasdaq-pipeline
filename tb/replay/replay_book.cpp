@@ -58,10 +58,13 @@ static uint32_t rtl_bucket(uint64_t ref){
     return folded % RTL_NUM_BUCKETS;
 }
 
-// same as hash_price in msg_pkg.sv: XOR the 2 16b halves, keep the low 10 bits
+// same as price_slot in msg_pkg.sv: from $1 up drop the 2 always-0 bits of a penny price, under $1 use the price itself
+static constexpr uint32_t ONE_DOLLAR = 10000; // 4 implied decimals
 static uint32_t rtl_slot(uint32_t price){
-    uint16_t folded = (uint16_t)(price ^ (price>>16));
-    return folded % RTL_L2_SLOTS;
+    if (price >= ONE_DOLLAR){
+        return (price >> 2) % RTL_L2_SLOTS;
+    }
+    return price % RTL_L2_SLOTS;
 }
 
 struct RtlFit{
