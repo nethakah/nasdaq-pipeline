@@ -1,4 +1,4 @@
-# Complete Nasdaq Trading Pipeline (HFT) on FPGA
+# Hardware Trader (Nasdaq)
 `SystemVerilog` · `Verilator/C++` · `Vivado 2024.1` · `PYNQ` · `Xilinx ZCU104 (XCZU7EV)`
 
 This project is my own build for a Nasdaq TotalView-ITCH 5.0 market data pipeline. As per high-frequency trading (HFT), this is implemented completely on an FPGA board, with configurable thresholds (memory writing in C/C++) to change trading strategies.
